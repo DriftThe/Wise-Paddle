@@ -6,3 +6,6 @@ outputs
 
 model
 
+text_result
+
+logs

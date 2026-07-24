@@ -46,6 +46,7 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 logger = logging.getLogger("wise-paddle.pipeline")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 兼容性补丁：transformers 5.x 不再带 "default" rope init 入口，老模型需要补
 # ─────────────────────────────────────────────────────────────────────────────
@@ -56,21 +57,21 @@ def _patch_rope_default() -> None:
         return
 
     def _compute_default_rope_parameters(
-        config,
-        device=None,
-        seq_len=None,
-        layer_type=None,
+            config,
+            device=None,
+            seq_len=None,
+            layer_type=None,
     ):
         base = config.rope_theta
         dim = getattr(config, "head_dim", None) or (
-            config.hidden_size // config.num_attention_heads
+                config.hidden_size // config.num_attention_heads
         )
         inv_freq = 1.0 / (
-            base
-            ** (
-                torch.arange(0, dim, 2, dtype=torch.int64).float().to(device)
-                / dim
-            )
+                base
+                ** (
+                        torch.arange(0, dim, 2, dtype=torch.int64).float().to(device)
+                        / dim
+                )
         )
         return inv_freq, 1.0
 
@@ -149,11 +150,11 @@ class LayoutDetector:
     """把任意尺寸的图过 PP-DocLayoutV3，返回 (box, label, score) 三元组。"""
 
     def __init__(
-        self,
-        model_path: str,
-        device: torch.device,
-        score_threshold: float = 0.5,
-        dtype: torch.dtype = torch.float32,
+            self,
+            model_path: str,
+            device: torch.device,
+            score_threshold: float = 0.5,
+            dtype: torch.dtype = torch.float32,
     ) -> None:
         logger.info("Loading layout model: %s", model_path)
         self.processor = AutoImageProcessor.from_pretrained(model_path)
@@ -230,10 +231,10 @@ class BoxFilter:
     """纯 numpy NMS + 过滤；不依赖额外库。"""
 
     def __init__(
-        self,
-        iou_threshold: float = 0.5,
-        min_area: float = 16 * 16,
-        min_score: float = 0.5,
+            self,
+            iou_threshold: float = 0.5,
+            min_area: float = 16 * 16,
+            min_score: float = 0.5,
     ) -> None:
         self.iou_threshold = iou_threshold
         self.min_area = min_area
@@ -310,15 +311,15 @@ class VLPredictor:
     }
 
     def __init__(
-        self,
-        model_path: str,
-        device: torch.device,
-        prompts: Optional[dict[str, str]] = None,
-        dtype: torch.dtype = torch.bfloat16,
-        max_new_tokens: int = 256,
-        max_pixels: int = 1280 * 28 * 28,  # 官方默认 1MP
-        max_forward_batch: int = 4,        # 单次 VL forward 最多 image 数（显存上限）
-        attn_impl: str = "sdpa",
+            self,
+            model_path: str,
+            device: torch.device,
+            prompts: Optional[dict[str, str]] = None,
+            dtype: torch.dtype = torch.bfloat16,
+            max_new_tokens: int = 256,
+            max_pixels: int = 1280 * 28 * 28,  # 官方默认 1MP
+            max_forward_batch: int = 10,  # 单次 VL forward 最多 image 数（显存上限）
+            attn_impl: str = "sdpa",
     ) -> None:
         logger.info("Loading VL model: %s", model_path)
         self.processor = AutoProcessor.from_pretrained(model_path)
@@ -351,9 +352,9 @@ class VLPredictor:
         tok = self.processor.tokenizer
         self.eos_token_id = tok.convert_tokens_to_ids("</s>") or tok.eos_token_id or 2
         self.pad_token_id = (
-            self.processor.tokenizer.pad_token_id
-            or tok.convert_tokens_to_ids("<unk>")
-            or 0
+                self.processor.tokenizer.pad_token_id
+                or tok.convert_tokens_to_ids("<unk>")
+                or 0
         )
 
     def _prompt_for(self, label: str) -> str:
@@ -386,7 +387,7 @@ class VLPredictor:
             tokenize=True,
             return_dict=True,
             return_tensors="pt",
-            padding=True,                     # batch 推理要 padding
+            padding=True,  # batch 推理要 padding
             images_kwargs={
                 "size": {
                     "shortest_edge": self.shortest_edge,
@@ -417,7 +418,7 @@ class VLPredictor:
 
     @torch.no_grad()
     def recognize_batch(
-        self, images: Sequence[Image.Image], label: str
+            self, images: Sequence[Image.Image], label: str
     ) -> list[str]:
         """同 label 的图用同一 prompt 做 batch 推理。len > max_forward_batch 时拆 sub-batch。
 
@@ -437,7 +438,7 @@ class VLPredictor:
 
     @torch.no_grad()
     def recognize_grouped(
-        self, items: list[tuple[Image.Image, str]]
+            self, items: list[tuple[Image.Image, str]]
     ) -> list[str]:
         """按 label 分桶 → 每个桶一次 batch 推理 → 按原顺序还原。"""
         # 桶：(label -> [(idx, img)])
@@ -462,16 +463,16 @@ class OCRPipeline:
     """对一张图跑 layout detection → 过滤 → 裁剪 → VL 识别 → 落盘。"""
 
     def __init__(
-        self,
-        layout_model_path: str,
-        vl_model_path: str,
-        device: torch.device,
-        output_dir: Path,
-        box_filter: Optional[BoxFilter] = None,
-        score_threshold: float = 0.5,
-        max_new_tokens: int = 256,
-        max_regions: int = 100,   # 几乎不限制，让每图所有 region 都进 VL
-        vl_max_forward_batch: int = 4,  # 单次 VL forward image 上限（显存）
+            self,
+            layout_model_path: str,
+            vl_model_path: str,
+            device: torch.device,
+            output_dir: Path,
+            box_filter: Optional[BoxFilter] = None,
+            score_threshold: float = 0.5,
+            max_new_tokens: int = 256,
+            max_regions: int = 100,  # 几乎不限制，让每图所有 region 都进 VL
+            vl_max_forward_batch: int = 4,  # 单次 VL forward image 上限（显存）
     ) -> None:
         self.device = device
         self.output_dir = Path(output_dir)
@@ -488,13 +489,18 @@ class OCRPipeline:
         )
         self.max_regions = max_regions
 
+    def _ensure_output_dir(self) -> None:
+        """每次处理前都确认根目录在（外部可能 mavis-trash 掉）。"""
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
     def process_page(
-        self,
-        image: Image.Image,
-        page_index: int = 0,
-        request_id: Optional[str] = None,
+            self,
+            image: Image.Image,
+            page_index: int = 0,
+            request_id: Optional[str] = None,
     ) -> PageResult:
         st = time.perf_counter()
+        self._ensure_output_dir()
         image = image.convert("RGB")
         w, h = image.size
 
@@ -572,6 +578,12 @@ class OCRPipeline:
         if not jobs:
             return []
         st = time.perf_counter()
+        self._ensure_output_dir()
+
+        # 防御：request_id 缺失会写到 output_dir 根目录，污染文件
+        for j in jobs:
+            if not j.request_id:
+                raise ValueError("Job.request_id must be set; got empty/None")
 
         # 1) layout detection 整批一次
         images_rgb: list[Image.Image] = [j.image.convert("RGB") for j in jobs]
@@ -647,9 +659,9 @@ class PipelinePool:
     """asyncio.Queue 实现的 pipeline 池。lease() 上下文管理器借出 / 归还。"""
 
     def __init__(
-        self,
-        size: int,
-        factory: Callable[[], OCRPipeline],
+            self,
+            size: int,
+            factory: Callable[[], OCRPipeline],
     ) -> None:
         if size < 1:
             raise ValueError("pool size must be >= 1")
@@ -693,23 +705,32 @@ class PipelinePool:
 # 7) BatchScheduler —— 攒批 + 借 pipeline + 分发结果
 # ─────────────────────────────────────────────────────────────────────────────
 class BatchScheduler:
-    """在 PipelinePool 之上做的"卡车"调度器：
+    """在 PipelinePool 之上做的"卡车"调度器，按 max-min fairness 拼批：
 
     - 上游：任意线程/协程 submit(request_id, page_idx, image) → 返回 Future[PageResult]
     - 下游：n_workers 个 worker 协程循环 ——
-        * 抢一个 Job 当头
-        * 继续等 flush_ms 时间，凑够 max_batch 个
+        * 抢 1 个 job 当头（按 fair 选 user）
+        * 继续等 flush_ms 时间，凑够 max_batch 个（按 fair 选 user）
         * 从 pool 借一个 pipeline
         * 调 pipeline.process_batch([...]) 一次处理整批（跨用户共享 layout + VL）
         * 把结果 set_result 回每个 Job 的 Future
+        * 更新每个 user 的"已完成数"用于下次公平分配
+
+    公平调度策略 (max-min fairness):
+        * 每个 user 独立 _user_pending: deque[Job] 队列
+        * 维护 _user_completed: dict[user, int] 跟踪每个 user 已完成的 job 数
+        * 拼 batch 时按 (completed, 首次出现顺序) 排序 user，completed 小的优先
+        * 第一轮：每个 user 各拿 1 张
+        * 第二轮：继续从 completed 最小的 user 拿，填满 max_batch
+        * 效果：长任务（PDF 多页）不会独占 batch，新来的小任务能立刻被分到
     """
 
     def __init__(
-        self,
-        pool: PipelinePool,
-        max_batch: int = 5,
-        flush_ms: float = 250.0,
-        n_workers: Optional[int] = None,
+            self,
+            pool: PipelinePool,
+            max_batch: int = 5,
+            flush_ms: float = 250.0,
+            n_workers: Optional[int] = None,
     ) -> None:
         if max_batch < 1:
             raise ValueError("max_batch must be >= 1")
@@ -718,7 +739,11 @@ class BatchScheduler:
         self.flush_seconds = flush_ms / 1000.0
         # 默认开跟 pool 一样多的 worker；pool=2 → 2 路 batch 并行
         self.n_workers = n_workers if n_workers is not None else pool.size
-        self._pending: list[Job] = []
+        # per-user 独立队列 + 完成数跟踪
+        self._user_pending: dict[str, "collections.deque[Job]"] = {}
+        self._user_order: list[str] = []  # user 首次出现顺序（断 ties）
+        self._user_completed: dict[str, int] = {}
+        self._pending_count = 0
         self._lock = asyncio.Lock()
         self._wakeup = asyncio.Event()
         self._closed = False
@@ -726,7 +751,7 @@ class BatchScheduler:
 
     async def start(self) -> None:
         logger.info(
-            "BatchScheduler starting %d worker(s), max_batch=%d, flush=%.0fms",
+            "BatchScheduler starting %d worker(s), max_batch=%d, flush=%.0fms (max-min fair)",
             self.n_workers, self.max_batch, self.flush_seconds * 1000,
         )
         for i in range(self.n_workers):
@@ -748,39 +773,103 @@ class BatchScheduler:
 
     def submit(self, request_id: str, page_index: int, image: Image.Image) -> Job:
         """提交一个 page 任务，返回 Job（Job.fut 是 asyncio.Future[PageResult]）。"""
+        import collections
         loop = asyncio.get_event_loop()
         fut: asyncio.Future[PageResult] = loop.create_future()
         job = Job(request_id=request_id, page_index=page_index, image=image, fut=fut)
-        # 直接 append + set wakeup（无 await，不算临界区）
-        self._pending.append(job)
+        # 放进 per-user 队列（首次出现的 user 加进 _user_order）
+        if request_id not in self._user_pending:
+            self._user_pending[request_id] = collections.deque()
+            self._user_order.append(request_id)
+        self._user_pending[request_id].append(job)
+        self._pending_count += 1
         self._wakeup.set()
         return job
 
     def pending_size(self) -> int:
-        return len(self._pending)
+        return self._pending_count
+
+    def _take_fair_batch(self, max_n: int) -> list:
+        """max-min fair 选 batch：优先选 '已完成数最少' 的 user。
+
+        调用者必须持有 self._lock。
+        """
+        if not self._user_pending or max_n <= 0:
+            return []
+        result: list[Job] = []
+        # 排序 key：(已完成数, 首次出现顺序) — 已完成少的 + 来得早的优先
+        order_idx = {u: i for i, u in enumerate(self._user_order)}
+
+        def _sort_key(u: str) -> tuple[int, int]:
+            return (self._user_completed.get(u, 0), order_idx.get(u, 0))
+
+        # 第一轮：每个 user 各拿 1 张
+        users = sorted(
+            [u for u in self._user_order if self._user_pending.get(u)],
+            key=_sort_key,
+        )
+        for u in users:
+            q = self._user_pending[u]
+            if not q:
+                continue
+            result.append(q.popleft())
+            if len(result) >= max_n:
+                break
+
+        # 第二轮：填满到 max_n（继续按 fair 选）
+        while len(result) < max_n:
+            users = sorted(
+                [u for u in self._user_order if self._user_pending.get(u)],
+                key=_sort_key,
+            )
+            if not users:
+                break
+            picked = False
+            for u in users:
+                q = self._user_pending[u]
+                if not q:
+                    continue
+                result.append(q.popleft())
+                picked = True
+                if len(result) >= max_n:
+                    break
+            if not picked:
+                break
+
+        # 清理空 user 队列（保留 _user_order 顺序历史）
+        for u in list(self._user_pending.keys()):
+            if not self._user_pending[u]:
+                del self._user_pending[u]
+
+        self._pending_count -= len(result)
+        return result
 
     async def _worker_loop(self, wid: int) -> None:
-        """worker 主循环：等至少 1 个 job → 凑 batch → 借 pipeline 处理 → 分发结果。"""
+        """worker 主循环：等至少 1 个 job → 按 fair 凑 batch → 借 pipeline → 跑批 → 分发。"""
         logger.info("scheduler worker[%d] started", wid)
         while not self._closed:
             # 1) 等到至少 1 个 job
-            while not self._pending and not self._closed:
+            while self._pending_count == 0 and not self._closed:
                 self._wakeup.clear()
                 await self._wakeup.wait()
             if self._closed:
                 break
+            if self._pending_count == 0:
+                continue
 
-            # 2) 抢 1 个 job 当头
+            # 2) 抢 1 个 job 当头（fair 选）
             async with self._lock:
-                if not self._pending:
-                    continue  # close 唤醒
-                batch = [self._pending.pop(0)]
-                if not self._pending:
+                if self._pending_count == 0:
+                    continue
+                batch = self._take_fair_batch(1)
+                if not batch:
+                    continue
+                if self._pending_count == 0:
                     self._wakeup.clear()
 
-            # 3) 凑 batch（直到 max_batch 或 flush_seconds 超时）
+            # 3) 凑 batch（max_batch 或 flush_seconds 超时；每轮都 fair 选）
             deadline = time.perf_counter() + self.flush_seconds
-            while len(batch) < self.max_batch:
+            while len(batch) < self.max_batch and self._pending_count > 0:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
                     break
@@ -789,9 +878,9 @@ class BatchScheduler:
                 except asyncio.TimeoutError:
                     break
                 async with self._lock:
-                    while self._pending and len(batch) < self.max_batch:
-                        batch.append(self._pending.pop(0))
-                    if not self._pending:
+                    more = self._take_fair_batch(self.max_batch - len(batch))
+                    batch.extend(more)
+                    if self._pending_count == 0:
                         self._wakeup.clear()
                 if len(batch) >= self.max_batch:
                     break
@@ -800,21 +889,30 @@ class BatchScheduler:
             t0 = time.perf_counter()
             async with self.pool.lease() as pipe:
                 wait = time.perf_counter() - t0
-                users = sorted({j.request_id for j in batch})
+                users_in_batch = sorted({j.request_id for j in batch})
+                user_in_batch_count: dict[str, int] = {}
+                for j in batch:
+                    user_in_batch_count[j.request_id] = user_in_batch_count.get(j.request_id, 0) + 1
                 logger.info(
-                    "scheduler[%d] lease: waited %.3fs, free=%d/%d, batch=%d (%d user %s)",
+                    "scheduler[%d] lease: waited %.3fs, free=%d/%d, batch=%d (%d user %s), per_user=%s",
                     wid, wait, self.pool.qsize(), self.pool.size,
-                    len(batch), len(users), users,
+                    len(batch), len(users_in_batch), users_in_batch,
+                    user_in_batch_count,
                 )
                 from starlette.concurrency import run_in_threadpool
                 results = await run_in_threadpool(pipe.process_batch, batch)
             dt = time.perf_counter() - t0
+            # 5) 更新每个 user 的已完成数（用于下次 fair 排序）
+            for u, c in user_in_batch_count.items():
+                self._user_completed[u] = self._user_completed.get(u, 0) + c
+            # 6) 分发结果
             for job, page in zip(batch, results):
                 if not job.fut.done():
                     job.fut.set_result(page)
             logger.info(
-                "scheduler[%d] done: batch=%d in %.2fs, free=%d/%d",
+                "scheduler[%d] done: batch=%d in %.2fs, free=%d/%d, user_completed=%s",
                 wid, len(batch), dt, self.pool.qsize(), self.pool.size,
+                {u: self._user_completed.get(u, 0) for u in users_in_batch},
             )
         logger.info("scheduler worker[%d] exited", wid)
 
@@ -828,8 +926,8 @@ DEFAULT_OUTPUT_DIR = Path("./text_result")
 
 
 def make_default_pipeline(
-    output_dir: Path = DEFAULT_OUTPUT_DIR,
-    device: Optional[torch.device] = None,
+        output_dir: Path = DEFAULT_OUTPUT_DIR,
+        device: Optional[torch.device] = None,
 ) -> OCRPipeline:
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return OCRPipeline(

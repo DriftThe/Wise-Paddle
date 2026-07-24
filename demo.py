@@ -1,16 +1,18 @@
 """
-Wise-Paddle uvicorn 服务（批处理调度版）
+Wise-Paddle uvicorn 服务（批处理调度版 + PDF 多页）
 
-设计：单 pipeline 一次处理一批（最多 5 张图），多用户的 page 任务
-由 BatchScheduler 跨用户聚合后送给 pipeline。layout detection 和
-VL 推理都能 batch 起来，单 pipeline 实例能打满 GPU 吞吐。
+设计：
+- 单 pipeline 一次处理一批（最多 BATCH_MAX 张图）
+- BatchScheduler 跨用户聚合 page 任务送给 pipeline
+- layout detection 和 VL 推理都能 batch 起来
+- 单 pipeline 实例能打满 GPU 吞吐
 
 HTTP 接口：
 - GET  /                          —— 前端 UI（单页 HTML）
 - GET  /health                    —— 健康 + scheduler/pool 状态
-- POST /ocr/upload                —— 上传图片（multipart），返回 OCR 结果 + 原图 base64
-- POST /ocr/base64                —— base64 JSON body，同上
-- POST /ocr/pdf                   —— PDF 占位（暂不真处理，返回 status=pending + placeholder）
+- POST /ocr/upload                —— 上传图片（multipart），返回 1 个 OCRPage
+- POST /ocr/base64                —— base64 JSON body，返回 1 个 OCRPage
+- POST /ocr/pdf                   —— 上传 PDF，转 N 页 PNG 入队，返回 N 个 OCRPage
 
 响应里 image_b64 是原图 PNG，前端拿到可以直接画到 canvas 上叠检测框。
 """
@@ -21,6 +23,7 @@ import asyncio
 import base64
 import io
 import logging
+import logging.handlers
 import os
 import time
 import uuid
@@ -32,7 +35,7 @@ import cv2
 import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -54,13 +57,48 @@ OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR)))
 POOL_SIZE = max(1, int(os.environ.get("PIPELINE_POOL_SIZE", "2")))
 BATCH_MAX = max(1, int(os.environ.get("BATCH_MAX", "5")))
 BATCH_FLUSH_MS = float(os.environ.get("BATCH_FLUSH_MS", "250"))
+LOG_DIR = Path(os.environ.get("LOG_DIR", "./logs"))
+LOG_KEEP_DAYS = int(os.environ.get("LOG_KEEP_DAYS", "14"))
+PDF_DPI = float(os.environ.get("PDF_DPI", "200"))  # PDF 渲染清晰度
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-)
+
+# ─── 日志（按日期写 logs/server-YYYY-MM-DD.log） ───────────────
+def _setup_logging() -> None:
+    """配置根 logger：控制台 + 按天滚动的文件 handler。"""
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    fmt = "%(asctime)s [%(levelname)s] %(name)s — %(message)s"
+    formatter = logging.Formatter(fmt)
+
+    # 控制台
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    sh.setLevel(logging.INFO)
+
+    # 按天滚动文件
+    log_file = LOG_DIR / "server.log"
+    fh = logging.handlers.TimedRotatingFileHandler(
+        filename=str(log_file),
+        when="midnight",
+        interval=1,
+        backupCount=LOG_KEEP_DAYS,
+        encoding="utf-8",
+        utc=False,
+    )
+    # suffix 改成 YYYY-MM-DD 而不是默认 YYYY-MM-DD_N
+    fh.suffix = "%Y-%m-%d"
+    fh.setFormatter(formatter)
+    fh.setLevel(logging.INFO)
+
+    root = logging.getLogger()
+    root.handlers.clear()  # 避免 uvicorn 默认 handler 重复
+    root.addHandler(sh)
+    root.addHandler(fh)
+    root.setLevel(logging.INFO)
+
+
+_setup_logging()
 logger = logging.getLogger("wise-paddle")
 
 # ─── Scheduler 生命周期 ────────────────────────────────────────
@@ -84,8 +122,8 @@ def _make_pipeline() -> OCRPipeline:
 async def lifespan(app: FastAPI):
     global scheduler, pool_ref
     logger.info(
-        "Building pipeline pool: %d pipeline(s), batch_max=%d, flush=%dms",
-        POOL_SIZE, BATCH_MAX, int(BATCH_FLUSH_MS),
+        "Building pipeline pool: %d pipeline(s), batch_max=%d, flush=%dms, pdf_dpi=%.0f",
+        POOL_SIZE, BATCH_MAX, int(BATCH_FLUSH_MS), PDF_DPI,
     )
     pool = PipelinePool(size=POOL_SIZE, factory=_make_pipeline)
     await pool.init()
@@ -112,7 +150,7 @@ async def lifespan(app: FastAPI):
         pool_ref = None
 
 
-app = FastAPI(title="Wise-Paddle Service", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Wise-Paddle Service", version="0.3.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -122,6 +160,8 @@ class Base64Request(BaseModel):
 
 
 class OCRRegion(BaseModel):
+    page_index: int = 0
+    box_index: int = 0
     label: str
     score: float
     rect: tuple[int, int, int, int]  # x1, y1, x2, y2
@@ -134,7 +174,6 @@ class OCRPage(BaseModel):
     width: int
     height: int
     image_b64: str = Field(..., description="原图 PNG base64；前端直接画到 canvas")
-    regions: list[OCRRegion]
 
 
 class OCRResponse(BaseModel):
@@ -147,6 +186,10 @@ class OCRResponse(BaseModel):
     pool_size: int
     pool_free: int
     pages: list[OCRPage]
+    regions: list[OCRRegion] = Field(
+        default_factory=list,
+        description="所有 page 摊平的 regions；按 page_index 分组可对应到 pages[i]",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -178,19 +221,46 @@ def _decode_b64_to_rgb(payload: str) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
-def _image_to_b64_png(rgb: np.ndarray) -> str:
-    """rgb HWC uint8 → png base64（无 data URI 前缀）"""
-    bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-    ok, buf = cv2.imencode(".png", bgr)
-    if not ok:
-        raise RuntimeError("PNG 编码失败")
-    return base64.b64encode(buf.tobytes()).decode("ascii")
+def _rgb_to_pil(rgb: np.ndarray) -> "PILImage":
+    from PIL import Image as PILImage
+
+    return PILImage.fromarray(rgb)
 
 
-def _get_scheduler() -> BatchScheduler:
-    if scheduler is None:
-        raise HTTPException(status_code=503, detail="Scheduler 尚未初始化")
-    return scheduler
+def _pil_to_b64_png(pil_img) -> str:
+    """PIL.Image → png base64。"""
+    buf = io.BytesIO()
+    # PDF 出来的图本来就是 RGB，PNG 编码前确认模式
+    if pil_img.mode != "RGB":
+        pil_img = pil_img.convert("RGB")
+    pil_img.save(buf, format="PNG", optimize=False)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _decode_pdf_to_pil_pages(raw: bytes, dpi: float = 200.0) -> list:
+    """PDF bytes → list[PIL.Image]，每页一张 RGB 图。in-memory，不落盘。"""
+    import pymupdf  # 软依赖
+
+    if not raw[:4] == b"%PDF":
+        raise ValueError("不是合法 PDF 文件")
+
+    zoom = dpi / 72.0  # PDF 坐标系 72 dpi
+    mat = pymupdf.Matrix(zoom, zoom)
+    pages: list = []
+    pdf = pymupdf.open(stream=raw, filetype="pdf")
+    try:
+        for page_num in range(len(pdf)):
+            page = pdf[page_num]
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            # pix.samples 是 RGB 字节（alpha=False 时是 RGB 而不是 RGBA）
+            # 直接构造 PIL Image 避免 numpy 中转
+            from PIL import Image as PILImage
+
+            img = PILImage.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            pages.append(img)
+    finally:
+        pdf.close()
+    return pages
 
 
 # ─── 路由 ────────────────────────────────────────────────────────
@@ -204,7 +274,7 @@ async def index():
 async def health():
     return HealthResponse(
         status="ok",
-        version="0.2.0",
+        version="0.3.0",
         pool_size=POOL_SIZE,
         pool_free=pool_ref.qsize() if pool_ref else 0,
         scheduler_pending=scheduler.pending_size() if scheduler else 0,
@@ -212,40 +282,81 @@ async def health():
     )
 
 
-async def _process_one_image(rgb: np.ndarray) -> tuple[str, OCRPage, float]:
-    """把一张 RGB 图送进 scheduler，等结果，转成 OCRPage（含原图 base64）。
+# ─── 核心：把 N 个 PIL page 提交到 scheduler，等所有完成 ────────────
+async def _process_pages(
+        request_id: str,
+        pil_pages: list,
+) -> tuple[list, float, float]:
+    """把一组 PIL 图全部提交给 BatchScheduler，等所有 page 完成后合并结果。
 
-    返回 (request_id, page, queue_wait_seconds)。
+    返回 (list[PageResult], queue_wait_seconds)
     """
-    from PIL import Image as PILImage
-
-    sched = _get_scheduler()
-    request_id = uuid.uuid4().hex[:8]
-    pil_img = PILImage.fromarray(rgb)
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="Scheduler 尚未初始化")
 
     submit_t = time.perf_counter()
-    job = sched.submit(request_id=request_id, page_index=0, image=pil_img)
-    page = await job.fut  # 阻塞等到 BatchScheduler 分发完成
+    # 一次性提交所有 page；BatchScheduler 会自动跨 page 凑 batch
+    jobs: list[Job] = []
+    for idx, pil_img in enumerate(pil_pages):
+        # 必须确保 RGB，否则后面 layout detect 报 mode 错
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
+        job = scheduler.submit(request_id=request_id, page_index=idx, image=pil_img)
+        jobs.append(job)
+
+    # 等所有 page 全部完成（asyncio.gather 跨 N 个 Future）
+    pages = await asyncio.gather(*(j.fut for j in jobs))
     queue_wait = time.perf_counter() - submit_t
+    return list(pages), queue_wait
 
-    return request_id, OCRPage(
-        page_index=page.page_index,
-        width=page.width,
-        height=page.height,
-        image_b64=_image_to_b64_png(rgb),
-        regions=[
-            OCRRegion(
-                label=r.label,
-                score=round(r.score, 4),
-                rect=r.rect,
-                md_path=str(r.md_path) if r.md_path else None,
-                markdown=r.markdown,
+
+def _build_ocr_response_with_images(
+        request_id: str,
+        pil_pages: list,
+        page_results: list,
+        elapsed: float,
+        queue_wait: float,
+) -> OCRResponse:
+    """组装 OCRResponse：每页含原图 b64 + 摊平所有 regions（带 page_index）。"""
+    all_regions: list[OCRRegion] = []
+    out_pages: list[OCRPage] = []
+    for pil, pr in zip(pil_pages, page_results):
+        b64 = _pil_to_b64_png(pil)
+        out_pages.append(
+            OCRPage(
+                page_index=pr.page_index,
+                width=pr.width,
+                height=pr.height,
+                image_b64=b64,
             )
-            for r in page.regions
-        ],
-    ), queue_wait
+        )
+        for b_idx, r in enumerate(pr.regions):
+            all_regions.append(
+                OCRRegion(
+                    page_index=pr.page_index,
+                    box_index=b_idx,
+                    label=r.label,
+                    score=round(r.score, 4),
+                    rect=r.rect,
+                    md_path=str(r.md_path) if r.md_path else None,
+                    markdown=r.markdown,
+                )
+            )
+    return OCRResponse(
+        success=True,
+        request_id=request_id,
+        status="done",
+        elapsed_seconds=round(elapsed, 3),
+        queue_wait_seconds=round(queue_wait, 3),
+        scheduler_pending=scheduler.pending_size() if scheduler else 0,
+        pool_size=POOL_SIZE,
+        pool_free=pool_ref.qsize() if pool_ref else 0,
+        pages=out_pages,
+        regions=all_regions,
+    )
 
 
+# ─── 路由：单图 ──────────────────────────────────────────────────
 @app.post("/ocr/upload", response_model=OCRResponse)
 async def ocr_upload(file: UploadFile = File(...)):
     raw = await file.read()
@@ -254,22 +365,15 @@ async def ocr_upload(file: UploadFile = File(...)):
     if img is None:
         raise HTTPException(status_code=400, detail="无法解码上传的图片")
     rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    pil = _rgb_to_pil(rgb)
 
-    sched = _get_scheduler()
+    request_id = uuid.uuid4().hex[:8]
     st = time.perf_counter()
-    request_id, page, queue_wait = await _process_one_image(rgb)
+    page_results, queue_wait = await _process_pages(request_id, [pil])
     elapsed = time.perf_counter() - st
 
-    return OCRResponse(
-        success=True,
-        request_id=request_id,
-        status="done",
-        elapsed_seconds=round(elapsed, 3),
-        queue_wait_seconds=round(queue_wait, 3),
-        scheduler_pending=sched.pending_size(),
-        pool_size=POOL_SIZE,
-        pool_free=pool_ref.qsize() if pool_ref else 0,
-        pages=[page],
+    return _build_ocr_response_with_images(
+        request_id, [pil], page_results, elapsed, queue_wait
     )
 
 
@@ -279,50 +383,53 @@ async def ocr_base64(req: Base64Request):
         rgb = _decode_b64_to_rgb(req.payload)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    pil = _rgb_to_pil(rgb)
 
-    sched = _get_scheduler()
+    request_id = uuid.uuid4().hex[:8]
     st = time.perf_counter()
-    request_id, page, queue_wait = await _process_one_image(rgb)
+    page_results, queue_wait = await _process_pages(request_id, [pil])
     elapsed = time.perf_counter() - st
 
-    return OCRResponse(
-        success=True,
-        request_id=request_id,
-        status="done",
-        elapsed_seconds=round(elapsed, 3),
-        queue_wait_seconds=round(queue_wait, 3),
-        scheduler_pending=sched.pending_size(),
-        pool_size=POOL_SIZE,
-        pool_free=pool_ref.qsize() if pool_ref else 0,
-        pages=[page],
+    return _build_ocr_response_with_images(
+        request_id, [pil], page_results, elapsed, queue_wait
     )
 
 
+# ─── 路由：PDF 多页 ──────────────────────────────────────────────
 @app.post("/ocr/pdf", response_model=OCRResponse)
 async def ocr_pdf(file: UploadFile = File(...)):
-    """PDF 占位：暂不真处理，只接住请求并返回状态。前端拿 placeholder 渲染。
+    """PDF → in-memory 转 N 张 PNG → 拆 N 个 Job 提交 BatchScheduler → 全部完成。
 
-    等 BatchScheduler 稳定后会加 pdf2image + 多页 batch 提交。
+    返回 pages 列表（长度 = PDF 页数），regions 列表（所有 page 摊平，每条带 page_index）。
     """
     raw = await file.read()
     if not raw[:4] == b"%PDF":
         raise HTTPException(status_code=400, detail="不是合法 PDF 文件")
+
+    # PDF 渲染放线程池里，pymupdf 偶尔会卡
+    try:
+        pil_pages = await run_in_threadpool(_decode_pdf_to_pil_pages, raw, PDF_DPI)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("PDF decode failed")
+        raise HTTPException(status_code=500, detail=f"PDF 解析失败: {e}")
+
+    if not pil_pages:
+        raise HTTPException(status_code=400, detail="PDF 没有页面")
+
+    logger.info(
+        "PDF decode: file=%s size=%d pages=%d (dpi=%.0f)",
+        file.filename, len(raw), len(pil_pages), PDF_DPI,
+    )
+
     request_id = uuid.uuid4().hex[:8]
-    logger.info("PDF placeholder: request_id=%s size=%d (no real processing yet)", request_id, len(raw))
-    return JSONResponse(
-        status_code=202,
-        content={
-            "success": True,
-            "request_id": request_id,
-            "status": "pending",
-            "message": "PDF 暂未实现，请用图片",
-            "elapsed_seconds": 0.0,
-            "queue_wait_seconds": 0.0,
-            "scheduler_pending": scheduler.pending_size() if scheduler else 0,
-            "pool_size": POOL_SIZE,
-            "pool_free": pool_ref.qsize() if pool_ref else 0,
-            "pages": [],
-        },
+    st = time.perf_counter()
+    page_results, queue_wait = await _process_pages(request_id, pil_pages)
+    elapsed = time.perf_counter() - st
+
+    return _build_ocr_response_with_images(
+        request_id, pil_pages, page_results, elapsed, queue_wait
     )
 
 
