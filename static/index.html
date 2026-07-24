@@ -1,0 +1,788 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Wise-Paddle · OCR Playground</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --bg-elev: #161b22;
+    --bg-elev2: #1f2630;
+    --bg-elev3: #2a3441;
+    --fg: #e6edf3;
+    --fg-dim: #8b949e;
+    --border: #30363d;
+    --accent: #58a6ff;
+    --accent-hover: #79b8ff;
+    --success: #3fb950;
+    --warn: #d29922;
+    --danger: #f85149;
+    --box-text: #56d364;
+    --box-image: #ffa657;
+    --box-table: #d2a8ff;
+    --shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    min-height: 100vh;
+  }
+  body { padding-bottom: 60px; }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    background: var(--bg-elev); position: sticky; top: 0; z-index: 10;
+  }
+  header h1 {
+    font-size: 15px; font-weight: 600; margin: 0;
+    display: flex; align-items: center; gap: 10px;
+  }
+  header h1 .logo {
+    width: 24px; height: 24px; border-radius: 5px;
+    background: linear-gradient(135deg, var(--accent), var(--box-image));
+    display: inline-block;
+  }
+  header .stats { display: flex; gap: 14px; font-size: 12px; color: var(--fg-dim); }
+  header .stats span b { color: var(--fg); margin-left: 4px; font-weight: 600; }
+
+  main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+
+  .card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    margin-bottom: 16px;
+  }
+
+  /* Drop zone */
+  .drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: 8px;
+    padding: 28px 16px;
+    text-align: center;
+    color: var(--fg-dim);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .drop-zone:hover, .drop-zone.drag-over {
+    border-color: var(--accent);
+    background: var(--bg-elev2);
+    color: var(--fg);
+  }
+  .drop-zone strong { color: var(--accent); }
+  .drop-zone input { display: none; }
+  .drop-zone .hint { font-size: 12px; margin-top: 6px; }
+
+  /* Queue */
+  .queue-section { margin-top: 16px; }
+  .queue-section h2 {
+    font-size: 13px; color: var(--fg-dim); font-weight: 500;
+    margin: 0 0 10px; display: flex; align-items: center; gap: 8px;
+  }
+  .queue-section h2 .count {
+    background: var(--bg-elev3); padding: 2px 8px; border-radius: 4px;
+    font-size: 11px; color: var(--fg); font-family: ui-monospace, Consolas, monospace;
+  }
+  .queue {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 10px;
+  }
+  .queue-item {
+    position: relative;
+    background: var(--bg-elev2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    aspect-ratio: 1;
+  }
+  .queue-item img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+  }
+  .queue-item .file-name {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 4px 6px;
+    background: linear-gradient(transparent, rgba(0,0,0,0.85));
+    font-size: 10px;
+    color: #fff;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .queue-item .badge {
+    position: absolute; top: 4px; left: 4px;
+    font-size: 10px; padding: 2px 6px; border-radius: 3px;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px;
+  }
+  .queue-item .badge.pending { background: var(--bg-elev3); color: var(--fg-dim); }
+  .queue-item .badge.processing { background: var(--accent); color: #fff; }
+  .queue-item .badge.done { background: var(--success); color: #fff; }
+  .queue-item .badge.error { background: var(--danger); color: #fff; }
+  .queue-item .remove {
+    position: absolute; top: 4px; right: 4px;
+    width: 20px; height: 20px; border-radius: 50%;
+    background: rgba(0,0,0,0.6); color: #fff;
+    border: none; cursor: pointer; font-size: 12px;
+    display: flex; align-items: center; justify-content: center;
+    line-height: 1;
+  }
+  .queue-item .remove:hover { background: var(--danger); }
+  .queue-item.processing::after {
+    content: '';
+    position: absolute; inset: 0;
+    border: 2px solid var(--accent);
+    border-radius: 6px;
+    animation: pulse 1.2s ease-in-out infinite;
+    pointer-events: none;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 1; }
+  }
+
+  .actions {
+    display: flex; gap: 10px; align-items: center; margin-top: 14px;
+  }
+  .btn {
+    background: var(--accent); color: #fff;
+    border: none; padding: 8px 16px;
+    border-radius: 6px; font-size: 13px; font-weight: 500;
+    cursor: pointer; transition: all 0.15s;
+  }
+  .btn:hover { background: var(--accent-hover); }
+  .btn:disabled {
+    background: var(--bg-elev3); color: var(--fg-dim); cursor: not-allowed;
+  }
+  .btn.ghost {
+    background: transparent; border: 1px solid var(--border); color: var(--fg-dim);
+  }
+  .btn.ghost:hover { background: var(--bg-elev2); color: var(--fg); }
+
+  /* Result card */
+  .result-card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 16px;
+    box-shadow: var(--shadow);
+  }
+  .result-card .head {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: flex-start;
+    gap: 16px; flex-wrap: wrap;
+  }
+  .result-card .title {
+    font-size: 13px; color: var(--fg);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .result-card .title strong {
+    color: var(--fg); font-weight: 500;
+  }
+  .result-card .rid {
+    font-size: 11px; color: var(--fg-dim);
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .result-card .timing {
+    display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+  }
+  .result-card .timing .big {
+    font-size: 24px; font-weight: 700; color: var(--success);
+    font-family: ui-monospace, Consolas, monospace;
+    letter-spacing: -0.5px;
+  }
+  .result-card .timing .small {
+    font-size: 11px; color: var(--fg-dim);
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .result-card .timing .small b {
+    color: var(--fg); font-weight: 600;
+  }
+
+  .canvas-wrap {
+    position: relative;
+    background: #000;
+    overflow: hidden;
+  }
+  .canvas-wrap img { display: block; width: 100%; height: auto; }
+  .canvas-wrap canvas {
+    position: absolute; left: 0; top: 0;
+    width: 100%; height: 100%;
+    cursor: crosshair;
+  }
+
+  .regions {
+    padding: 16px 20px;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 10px;
+    background: var(--bg-elev);
+  }
+  .region {
+    background: var(--bg-elev2);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--box-text);
+    border-radius: 6px;
+    padding: 10px 12px;
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+  .region:hover { background: var(--bg-elev3); }
+  .region.copied { background: rgba(63, 185, 80, 0.15); border-color: var(--success); }
+  .region[data-label="image"] { border-left-color: var(--box-image); }
+  .region[data-label="table"] { border-left-color: var(--box-table); }
+  .region[data-label="formula"] { border-left-color: var(--box-table); }
+  .region[data-label="chart"] { border-left-color: var(--box-image); }
+  .region .r-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+  .region .r-label { font-size: 11px; font-family: ui-monospace, Consolas, monospace; color: var(--fg-dim); }
+  .region .r-score { font-size: 11px; color: var(--fg-dim); font-family: ui-monospace, Consolas, monospace; }
+  .region .r-text {
+    font-size: 13px; line-height: 1.5; color: var(--fg);
+    word-break: break-word;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .region .r-text:empty::before {
+    content: "(空)"; color: var(--fg-dim); font-style: italic;
+  }
+  .region .r-hint {
+    font-size: 10px; color: var(--fg-dim); margin-top: 6px;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+
+  /* Placeholders */
+  .placeholder {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 32px 20px;
+    text-align: center;
+    color: var(--fg-dim);
+  }
+  .placeholder .icon { font-size: 32px; margin-bottom: 8px; }
+
+  .pdf-placeholder {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--bg-elev2); border: 1px solid var(--border);
+    border-left: 3px solid var(--warn);
+    border-radius: 6px; padding: 12px 16px;
+    color: var(--fg-dim); font-size: 13px;
+    margin: 16px 0;
+  }
+  .pdf-placeholder .pulse {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--warn);
+    animation: pulse 1.2s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+
+  /* Toast */
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px);
+    background: var(--success); color: #fff;
+    padding: 8px 16px; border-radius: 6px;
+    font-size: 13px; font-weight: 500;
+    opacity: 0; pointer-events: none;
+    transition: all 0.2s;
+    z-index: 100;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast.err { background: var(--danger); }
+
+  .empty-state {
+    text-align: center; color: var(--fg-dim);
+    padding: 32px 16px; font-size: 13px;
+  }
+
+  /* 检测框颜色 (与 region 卡片一致) */
+  .box-text { stroke: var(--box-text); }
+  .box-image { stroke: var(--box-image); }
+  .box-table, .box-formula, .box-chart { stroke: var(--box-table); }
+  .box-text.fill { fill: rgba(86, 211, 100, 0.18); }
+  .box-image.fill { fill: rgba(255, 166, 87, 0.18); }
+  .box-table.fill, .box-formula.fill, .box-chart.fill { fill: rgba(210, 168, 255, 0.18); }
+
+  @media (max-width: 640px) {
+    main { padding: 12px; }
+    .result-card .head { padding: 12px 14px; }
+    .regions { padding: 12px 14px; }
+    .result-card .timing .big { font-size: 20px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="logo"></span> Wise-Paddle · OCR Playground</h1>
+  <div class="stats">
+    <span>pool <b id="stat-pool">–</b></span>
+    <span>pending <b id="stat-pending">–</b></span>
+    <span>batch <b id="stat-batch">–</b></span>
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <label class="drop-zone" id="drop-zone">
+      <input type="file" id="file-input" accept="image/*,application/pdf" multiple />
+      <div>把图片拖到这里，或者 <strong>点我选择</strong></div>
+      <div class="hint">支持 PNG / JPG / WebP · PDF 显示占位 · 多选 OK</div>
+    </label>
+
+    <div class="queue-section" id="queue-section" style="display:none;">
+      <h2>队列 <span class="count" id="queue-count">0</span></h2>
+      <div class="queue" id="queue"></div>
+      <div class="actions">
+        <button class="btn" id="start-btn" disabled>开始处理</button>
+        <button class="btn ghost" id="clear-btn">清空队列</button>
+        <span style="font-size:12px;color:var(--fg-dim);margin-left:auto;" id="queue-status"></span>
+      </div>
+    </div>
+  </div>
+
+  <div id="result-list"></div>
+  <div id="empty" class="empty-state">还没有结果。先在左边加几张图，点"开始处理"。</div>
+</main>
+
+<div class="toast" id="toast">已复制</div>
+
+<script>
+"use strict";
+
+const $ = (sel) => document.querySelector(sel);
+const resultList = $("#result-list");
+const empty = $("#empty");
+const toast = $("#toast");
+const queueSection = $("#queue-section");
+const queueEl = $("#queue");
+const queueCountEl = $("#queue-count");
+const startBtn = $("#start-btn");
+const clearBtn = $("#clear-btn");
+const queueStatus = $("#queue-status");
+const fileInput = $("#file-input");
+let resultSeq = 0;
+
+// ===== 队列状态 =====
+/** @type {Array<{id:string,file:File,fileUrl:string,status:'pending'|'processing'|'done'|'error'}>} */
+const queue = [];
+
+function uid() { return Math.random().toString(36).slice(2, 10); }
+
+function showToast(msg, isErr = false) {
+  toast.textContent = msg;
+  toast.classList.toggle("err", isErr);
+  toast.classList.add("show");
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => toast.classList.remove("show"), 1500);
+}
+
+async function copyText(text, silent = false) {
+  if (!text) {
+    if (!silent) showToast("该区域无文字", true);
+    return false;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    // fallback for non-secure context
+    const ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand("copy"); ta.remove();
+  }
+  if (!silent) showToast(`已复制 ${text.length} 字符`);
+  return true;
+}
+
+// ===== Health polling =====
+async function pollHealth() {
+  try {
+    const r = await fetch("/health");
+    const d = await r.json();
+    $("#stat-pool").textContent = `${d.pool_free}/${d.pool_size}`;
+    $("#stat-pending").textContent = d.scheduler_pending;
+    $("#stat-batch").textContent = d.batch_max;
+  } catch (e) { /* ignore */ }
+}
+setInterval(pollHealth, 1500);
+pollHealth();
+
+// ===== Drop zone =====
+const dz = $("#drop-zone");
+dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("drag-over"); });
+dz.addEventListener("dragleave", () => dz.classList.remove("drag-over"));
+dz.addEventListener("drop", (e) => {
+  e.preventDefault(); dz.classList.remove("drag-over");
+  handleFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener("change", (e) => handleFiles(e.target.files));
+
+function handleFiles(fileList) {
+  const items = [];
+  for (const f of fileList) {
+    const isPdf = f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
+    const item = {
+      id: uid(),
+      file: f,
+      fileUrl: isPdf ? null : URL.createObjectURL(f),
+      status: "pending",
+      isPdf,
+    };
+    queue.push(item);
+    items.push(item);
+  }
+  renderQueue();
+  fileInput.value = "";
+}
+
+function renderQueue() {
+  const pending = queue.filter(q => q.status === "pending").length;
+  const processing = queue.filter(q => q.status === "processing").length;
+  queueCountEl.textContent = String(queue.length);
+  if (queue.length === 0) {
+    queueSection.style.display = "none";
+    return;
+  }
+  queueSection.style.display = "";
+  startBtn.disabled = pending === 0;
+
+  queueEl.innerHTML = queue.map(q => {
+    const thumb = q.isPdf
+      ? `<div style="display:flex;align-items:center;justify-content:center;height:100%;font-size:32px;color:var(--warn);">PDF</div>`
+      : `<img src="${q.fileUrl}" alt="" />`;
+    const statusLabel = { pending: "待处理", processing: "处理中", done: "完成", error: "失败" }[q.status];
+    return `
+      <div class="queue-item ${q.status}" data-id="${q.id}">
+        ${thumb}
+        <span class="badge ${q.status}">${statusLabel}</span>
+        <button class="remove" data-id="${q.id}" title="移除">×</button>
+        <div class="file-name">${escapeHtml(q.file.name)}</div>
+      </div>`;
+  }).join("");
+
+  queueStatus.textContent = processing > 0
+    ? `处理中 ${processing} 张，剩 ${pending} 张待处理`
+    : (pending > 0 ? `${pending} 张待处理` : (queue.length > 0 ? `全部 ${queue.length} 张已完成` : ""));
+
+  // wire remove buttons
+  queueEl.querySelectorAll(".remove").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.id;
+      const idx = queue.findIndex(q => q.id === id);
+      if (idx >= 0) {
+        if (queue[idx].fileUrl) URL.revokeObjectURL(queue[idx].fileUrl);
+        queue.splice(idx, 1);
+        renderQueue();
+      }
+    });
+  });
+}
+
+clearBtn.addEventListener("click", () => {
+  queue.forEach(q => { if (q.fileUrl) URL.revokeObjectURL(q.fileUrl); });
+  queue.length = 0;
+  renderQueue();
+});
+
+// ===== 开始处理 =====
+startBtn.addEventListener("click", async () => {
+  const items = queue.filter(q => q.status === "pending");
+  if (items.length === 0) return;
+  // 标记 processing
+  items.forEach(q => q.status = "processing");
+  renderQueue();
+
+  // 并发 send 全部 pending（后端 BatchScheduler 会自动凑 batch）
+  await Promise.all(items.map(q => processOne(q)));
+});
+
+async function processOne(item) {
+  const t0 = performance.now();
+  try {
+    if (item.isPdf) {
+      // PDF 占位
+      const fd = new FormData();
+      fd.append("file", item.file);
+      const r = await fetch("/ocr/pdf", { method: "POST", body: fd });
+      const data = await r.json();
+      item.status = "done";
+      renderQueue();
+      buildPdfPlaceholderCard(item, data, performance.now() - t0);
+      return;
+    }
+    const fd = new FormData();
+    fd.append("file", item.file);
+    const r = await fetch("/ocr/upload", { method: "POST", body: fd, signal: AbortSignal.timeout(600_000) });
+    const wallMs = performance.now() - t0;
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      item.status = "error";
+      renderQueue();
+      buildErrorCard(item, err.detail || `HTTP ${r.status}`, wallMs);
+      return;
+    }
+    const data = await r.json();
+    item.status = "done";
+    renderQueue();
+    buildResultCard(item, data, wallMs);
+  } catch (e) {
+    item.status = "error";
+    renderQueue();
+    buildErrorCard(item, String(e), performance.now() - t0);
+  }
+}
+
+// ===== Result cards =====
+
+function buildErrorCard(item, msg, wallMs) {
+  const seq = ++resultSeq;
+  empty.style.display = "none";
+  const card = document.createElement("div");
+  card.className = "result-card";
+  card.dataset.seq = seq;
+  card.innerHTML = `
+    <div class="head">
+      <div class="title">⚠️ <strong>${escapeHtml(item.file.name)}</strong></div>
+      <div class="timing">
+        <div class="big" style="color:var(--danger);">失败</div>
+        <div class="small">wall <b>${(wallMs/1000).toFixed(2)}s</b></div>
+      </div>
+    </div>
+    <div class="pdf-placeholder" style="border-left-color:var(--danger);">
+      <div class="pulse" style="background:var(--danger);"></div>
+      <div>${escapeHtml(msg)}</div>
+    </div>
+  `;
+  resultList.prepend(card);
+}
+
+function buildPdfPlaceholderCard(item, data, wallMs) {
+  const seq = ++resultSeq;
+  empty.style.display = "none";
+  const card = document.createElement("div");
+  card.className = "result-card";
+  card.dataset.seq = seq;
+  card.innerHTML = `
+    <div class="head">
+      <div class="title">📄 <strong>${escapeHtml(item.file.name)}</strong>
+        <span class="rid">request_id <b>${data.request_id || "–"}</b></span>
+      </div>
+      <div class="timing">
+        <div class="big" style="color:var(--warn);">PDF</div>
+        <div class="small">未实现</div>
+      </div>
+    </div>
+    <div class="pdf-placeholder">
+      <div class="pulse"></div>
+      <div>PDF 暂未实现 - 当前仅图片流程跑通。后续会接 pdf2image → 多页 batch 提交。</div>
+    </div>
+  `;
+  resultList.prepend(card);
+}
+
+function buildResultCard(item, data, wallMs) {
+  const seq = ++resultSeq;
+  empty.style.display = "none";
+  const card = document.createElement("div");
+  card.className = "result-card";
+  card.dataset.seq = seq;
+  const p = data.pages[0];
+  const wallS = wallMs / 1000;
+  const serverS = data.elapsed_seconds;
+  const queueS = data.queue_wait_seconds;
+  const regions = p.regions;
+  const regionCount = regions.length;
+
+  // 构造 region 卡片 HTML
+  const regionCards = regions.map((r, i) => {
+    return `
+      <div class="region" data-idx="${i}" data-label="${escapeHtml(r.label)}"
+           data-rect="${r.rect.join(",")}" data-score="${r.score}">
+        <div class="r-head">
+          <span class="r-label">${escapeHtml(r.label)}</span>
+          <span class="r-score">${(r.score * 100).toFixed(1)}% · #${i}</span>
+        </div>
+        <div class="r-text">${escapeHtml(r.markdown || "")}</div>
+        <div class="r-hint">悬停框即复制</div>
+      </div>`;
+  }).join("");
+
+  card.innerHTML = `
+    <div class="head">
+      <div class="title">
+        🖼 <strong>${escapeHtml(item.file.name)}</strong>
+        <span class="rid">request_id <b>${data.request_id}</b> · ${regionCount} region(s)</span>
+      </div>
+      <div class="timing">
+        <div class="big">${serverS.toFixed(2)}<span style="font-size:14px;color:var(--fg-dim);">s</span></div>
+        <div class="small">wall <b>${wallS.toFixed(2)}s</b><br>queue <b>${queueS.toFixed(2)}s</b></div>
+      </div>
+    </div>
+    <div class="canvas-wrap" data-img-b64="${p.image_b64}" data-w="${p.width}" data-h="${p.height}">
+      <img src="data:image/png;base64,${p.image_b64}" alt="page" />
+      <canvas></canvas>
+    </div>
+    <div class="regions">${regionCards || '<div class="empty-state">未检测到任何区域</div>'}</div>
+  `;
+  resultList.prepend(card);
+  wireCardEvents(card);
+}
+
+// ===== Canvas 检测框 + hover-copy =====
+function wireCardEvents(card) {
+  const wrap = card.querySelector(".canvas-wrap");
+  const img = wrap.querySelector("img");
+  const canvas = wrap.querySelector("canvas");
+  const regions = card.querySelectorAll(".region");
+
+  // 从 DOM dataset 拿 region 数据
+  const regionData = Array.from(regions).map(el => ({
+    label: el.dataset.label,
+    score: parseFloat(el.dataset.score),
+    rect: el.dataset.rect.split(",").map(Number),
+    el,
+  }));
+
+  // dpr 缩放 + 检测框绘制
+  const setup = () => {
+    const dpr = window.devicePixelRatio || 1;
+    const r = wrap.getBoundingClientRect();
+    // canvas 实际像素 = CSS 像素 * dpr (HiDPI 清晰)
+    canvas.width = Math.round(r.width * dpr);
+    canvas.height = Math.round(r.height * dpr);
+    canvas.style.width = r.width + "px";
+    canvas.style.height = r.height + "px";
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);  // 用 CSS 像素画，dpr 自动放大
+    drawBoxes(ctx, regionData, parseInt(wrap.dataset.w), parseInt(wrap.dataset.h), r.width, r.height, -1);
+  };
+
+  // 等图片布局好（onload 触发时图片已显示宽高）
+  if (img.complete && img.naturalWidth > 0) {
+    setup();
+  } else {
+    img.addEventListener("load", setup);
+  }
+  // layout 可能还在变（CSS 布局完成前 getBoundingClientRect 拿不准）
+  requestAnimationFrame(() => requestAnimationFrame(setup));
+  window.addEventListener("resize", setup);
+
+  // ===== hover canvas 框 → 复制 =====
+  let lastHoverIdx = -1;
+  canvas.addEventListener("mousemove", (e) => {
+    const idx = hitTestBox(e, canvas, regionData, parseInt(wrap.dataset.w), parseInt(wrap.dataset.h));
+    if (idx !== lastHoverIdx) {
+      lastHoverIdx = idx;
+      if (idx >= 0) {
+        const r = wrap.getBoundingClientRect();
+        const ctx = canvas.getContext("2d");
+        drawBoxes(ctx, regionData, parseInt(wrap.dataset.w), parseInt(wrap.dataset.h), r.width, r.height, idx);
+        canvas.style.cursor = "pointer";
+      } else {
+        const r = wrap.getBoundingClientRect();
+        const ctx = canvas.getContext("2d");
+        drawBoxes(ctx, regionData, parseInt(wrap.dataset.w), parseInt(wrap.dataset.h), r.width, r.height, -1);
+        canvas.style.cursor = "crosshair";
+      }
+    }
+  });
+
+  canvas.addEventListener("mouseleave", () => {
+    if (lastHoverIdx >= 0) {
+      lastHoverIdx = -1;
+      const r = wrap.getBoundingClientRect();
+      const ctx = canvas.getContext("2d");
+      drawBoxes(ctx, regionData, parseInt(wrap.dataset.w), parseInt(wrap.dataset.h), r.width, r.height, -1);
+      canvas.style.cursor = "crosshair";
+    }
+  });
+
+  // 点击 canvas 框 → 也复制
+  canvas.addEventListener("click", (e) => {
+    const idx = hitTestBox(e, canvas, regionData, parseInt(wrap.dataset.w), parseInt(wrap.dataset.h));
+    if (idx >= 0) {
+      const text = regionData[idx].el.querySelector(".r-text").textContent;
+      copyText(text);
+      regionData[idx].el.classList.add("copied");
+      setTimeout(() => regionData[idx].el.classList.remove("copied"), 700);
+    }
+  });
+
+  // 点击 region 卡片 → 复制 + 闪绿色反馈
+  regions.forEach((el) => {
+    el.addEventListener("click", () => {
+      const text = el.querySelector(".r-text").textContent;
+      copyText(text);
+      el.classList.add("copied");
+      setTimeout(() => el.classList.remove("copied"), 700);
+    });
+  });
+}
+
+function hitTestBox(e, canvas, regionData, srcW, srcH) {
+  const r = canvas.getBoundingClientRect();
+  const sx = r.width / srcW, sy = r.height / srcH;
+  // CSS 像素（canvas 用 ctx 画时是 CSS 像素）
+  const cx = (e.clientX - r.left);
+  const cy = (e.clientY - r.top);
+  // 从后往前 hit（最上层先匹配）
+  for (let i = regionData.length - 1; i >= 0; i--) {
+    const [x1, y1, x2, y2] = regionData[i].rect;
+    if (cx >= x1 * sx && cx <= x2 * sx && cy >= y1 * sy && cy <= y2 * sy) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function drawBoxes(ctx, regions, srcW, srcH, dstW, dstH, highlightIdx) {
+  ctx.clearRect(0, 0, dstW, dstH);
+  const sx = dstW / srcW, sy = dstH / srcH;
+  const root = getComputedStyle(document.documentElement);
+  const colorMap = {
+    text: root.getPropertyValue("--box-text").trim(),
+    image: root.getPropertyValue("--box-image").trim(),
+    table: root.getPropertyValue("--box-table").trim(),
+    formula: root.getPropertyValue("--box-table").trim(),
+    chart: root.getPropertyValue("--box-image").trim(),
+  };
+  regions.forEach((r, i) => {
+    const [x1, y1, x2, y2] = r.rect;
+    const isHi = (i === highlightIdx);
+    ctx.lineWidth = isHi ? 3 : 1.5;
+    ctx.strokeStyle = colorMap[r.label] || colorMap.text;
+    if (isHi) {
+      ctx.fillStyle = colorMap[r.label] || colorMap.text;
+      ctx.globalAlpha = 0.18;
+    } else {
+      ctx.fillStyle = "transparent";
+      ctx.globalAlpha = 1;
+    }
+    const w = (x2 - x1) * sx, h = (y2 - y1) * sy;
+    ctx.fillRect(x1 * sx, y1 * sy, w, h);
+    ctx.globalAlpha = 1;
+    ctx.strokeRect(x1 * sx, y1 * sy, w, h);
+
+    // 高亮时画 label tag
+    if (isHi) {
+      ctx.font = '600 12px ui-monospace, Consolas, monospace';
+      const txt = `${r.label} · #${i} · ${Math.round(r.score * 100)}%`;
+      const tw = ctx.measureText(txt).width;
+      const tagH = 18, padX = 6;
+      let ty = y1 * sy - tagH - 2;
+      if (ty < 0) ty = y1 * sy + 2;
+      ctx.fillStyle = colorMap[r.label] || colorMap.text;
+      ctx.fillRect(x1 * sx, ty, tw + padX * 2, tagH);
+      ctx.fillStyle = "#0e1116";
+      ctx.fillText(txt, x1 * sx + padX, ty + 13);
+    }
+  });
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+</script>
+</body>
+</html>
