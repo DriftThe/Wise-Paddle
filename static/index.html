@@ -322,11 +322,12 @@
     opacity: 0.6;
   }
   .page-slot[data-status="processing"] .canvas-wrap::after {
-    content: "";
+    content: "处理中…";
     position: absolute; inset: 0;
     display: flex; align-items: center; justify-content: center;
     background: rgba(0,0,0,0.45);
     color: #fff; font-size: 13px;
+    font-family: ui-monospace, Consolas, monospace;
     pointer-events: none;
   }
   .page-slot[data-status="processing"] .canvas-wrap::before {
@@ -378,6 +379,103 @@
     padding: 32px 16px; font-size: 13px;
   }
 
+  /* Result switcher (sticky 顶部横条, 多结果卡片导航) */
+  .result-switcher {
+    position: sticky; top: 49px; z-index: 9;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 10px;
+    margin-bottom: 16px;
+    display: none;  /* 没结果时隐藏 */
+    align-items: center; gap: 8px;
+    box-shadow: var(--shadow);
+  }
+  .result-switcher.show { display: flex; }
+  .result-switcher .rs-label {
+    color: var(--fg-dim); font-size: 11px;
+    font-family: ui-monospace, Consolas, monospace;
+    flex-shrink: 0;
+  }
+  .result-switcher .rs-tabs {
+    display: flex; gap: 6px;
+    flex: 1; overflow-x: auto;
+    scrollbar-width: thin;
+  }
+  .result-switcher .rs-tab {
+    flex-shrink: 0;
+    background: var(--bg-elev2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    cursor: pointer;
+    display: flex; align-items: center; gap: 6px;
+    min-width: 64px; max-width: 180px;
+    transition: all 0.12s;
+  }
+  .result-switcher .rs-tab:hover {
+    background: var(--bg-elev3);
+    border-color: var(--accent);
+  }
+  .result-switcher .rs-tab.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .result-switcher .rs-tab-thumb {
+    width: 24px; height: 24px;
+    border-radius: 3px;
+    object-fit: cover;
+    background: #000;
+    flex-shrink: 0;
+  }
+  .result-switcher .rs-tab-text {
+    display: flex; flex-direction: column; gap: 1px;
+    min-width: 0;
+  }
+  .result-switcher .rs-tab-num {
+    font-size: 10px; color: var(--fg-dim);
+    font-family: ui-monospace, Consolas, monospace;
+    line-height: 1;
+  }
+  .result-switcher .rs-tab.active .rs-tab-num { color: rgba(255,255,255,0.8); }
+  .result-switcher .rs-tab-name {
+    font-size: 11px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    max-width: 130px;
+  }
+  .result-switcher .rs-tab-status {
+    font-size: 9px; padding: 1px 5px; border-radius: 2px;
+    text-transform: uppercase; letter-spacing: 0.3px;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .result-switcher .rs-tab-status.processing { background: var(--accent); color: #fff; }
+  .result-switcher .rs-tab-status.done { background: var(--success); color: #fff; }
+  .result-switcher .rs-tab-status.error { background: var(--danger); color: #fff; }
+  .result-switcher .rs-btn {
+    background: var(--bg-elev3); color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 4px 10px; border-radius: 4px;
+    font-size: 12px; cursor: pointer; flex-shrink: 0;
+  }
+  .result-switcher .rs-btn:hover { background: var(--accent); color: #fff; }
+  .result-switcher .rs-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .result-switcher .rs-info {
+    color: var(--fg-dim); font-size: 11px;
+    font-family: ui-monospace, Consolas, monospace;
+    flex-shrink: 0;
+  }
+
+  /* result-card 高亮（点击 rs-tab 滚动到该卡片时） */
+  .result-card.scroll-target {
+    animation: highlight 1.5s ease-out;
+  }
+  @keyframes highlight {
+    0% { box-shadow: 0 0 0 3px var(--accent); }
+    100% { box-shadow: var(--shadow); }
+  }
+
   /* 检测框颜色 (与 region 卡片一致) */
   .box-text { stroke: var(--box-text); }
   .box-image { stroke: var(--box-image); }
@@ -426,6 +524,14 @@
     </div>
   </div>
 
+  <div class="result-switcher" id="result-switcher">
+    <span class="rs-label">结果</span>
+    <button class="rs-btn" id="rs-prev" disabled>‹</button>
+    <div class="rs-tabs" id="rs-tabs"></div>
+    <button class="rs-btn" id="rs-next" disabled>›</button>
+    <span class="rs-info" id="rs-info">0 / 0</span>
+  </div>
+
   <div id="result-list"></div>
   <div id="empty" class="empty-state">还没有结果。先在左边加文件，点"开始处理"。</div>
 </main>
@@ -457,7 +563,17 @@ const clearQueueBtn = $("#clear-queue-btn");
 const clearResultsBtn = $("#clear-results-btn");
 const queueStatus = $("#queue-status");
 const fileInput = $("#file-input");
+const rs = $("#result-switcher");
+const rsTabs = $("#rs-tabs");
+const rsPrev = $("#rs-prev");
+const rsNext = $("#rs-next");
+const rsInfo = $("#rs-info");
 let resultSeq = 0;
+// user_id → request_id 映射; 每个 queue item 一个 user_id
+// 用于 heartbeat 和 tab close 时的 release
+const activeUserIds = new Set();
+let hbTimer = null;
+const HB_INTERVAL_MS = 10_000;
 
 // ===== 队列状态 =====
 /**
@@ -645,27 +761,49 @@ async function processOne(item) {
   const t0 = performance.now();
   // 1) 立即建一个"处理中"placeholder card
   const ctl = buildPlaceholderCard(item);
+  // 2) 申请一个 user_id（= 首次返回的 request_id 不可知, 先用 client-side 临时 ID,
+  //    server 在响应里返回真实 request_id 后, 我们用 sendBeacon 重新注册
+  //    简化做法: 用 client 临时 ID, 服务端 scheduler.submit 时也用同一个 ID 做 heartbeat
+  //    —— 但 server OCRResponse 里的 request_id 才是 server 视角的 ID, 我们需要让 server 关联
+  //    解决: 改 API 让客户端传 user_id 进来, server submit 时用同一个
+  //    -- 改动见 demo.py: ocr_upload / ocr_pdf 支持 user_id from query/header
+  const clientUserId = `web-${uid()}`;
+  activeUserIds.add(clientUserId);
   try {
     const fd = new FormData();
     fd.append("file", item.file);
     const url = item.isPdf ? "/ocr/pdf" : "/ocr/upload";
-    const r = await fetch(url, { method: "POST", body: fd, signal: AbortSignal.timeout(900_000) });
+    const r = await fetch(`${url}?user_id=${encodeURIComponent(clientUserId)}`,
+      { method: "POST", body: fd, signal: AbortSignal.timeout(900_000) });
     const wallMs = performance.now() - t0;
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       item.status = "error";
       renderQueue();
       markCardError(ctl, err.detail || `HTTP ${r.status}`, wallMs);
+      // 失败时也要释放 user_id（不会再有结果）
+      activeUserIds.delete(clientUserId);
+      try {
+        const blob = new Blob([JSON.stringify({ user_id: clientUserId })], { type: "application/json" });
+        navigator.sendBeacon("/api/release", blob);
+      } catch (e) {}
       return;
     }
     const data = await r.json();
     item.status = "done";
     renderQueue();
+    // 任务完成, 不再需要心跳 + 释放
+    activeUserIds.delete(clientUserId);
     fillCardWithResult(ctl, item, data, wallMs);
   } catch (e) {
     item.status = "error";
     renderQueue();
     markCardError(ctl, String(e), performance.now() - t0);
+    activeUserIds.delete(clientUserId);
+    try {
+      const blob = new Blob([JSON.stringify({ user_id: clientUserId })], { type: "application/json" });
+      navigator.sendBeacon("/api/release", blob);
+    } catch (e) {}
   }
 }
 
@@ -767,6 +905,9 @@ function buildPlaceholderCard(item) {
   resultList.prepend(card);
   updateClearResultsBtn();
 
+  // 在 result-switcher 注册该 card
+  addResultTab(seq, item);
+
   const showPage = (idx) => {
     idx = Math.max(0, Math.min(totalPages - 1, idx));
     pageSlots.forEach((s, i) => { s.style.display = (i === idx) ? "" : "none"; });
@@ -781,7 +922,7 @@ function buildPlaceholderCard(item) {
     if (c0) c0.classList.add("active");
   }
 
-  return { card, head, nav, chips, info, pageSlots, totalPages, showPage };
+  return { card, head, nav, chips, info, pageSlots, totalPages, showPage, seq };
 }
 
 /**
@@ -791,6 +932,8 @@ function fillCardWithResult(ctl, item, data, wallMs) {
   const isPdf = item.isPdf;
   const totalPages = (data.pages || []).length;
   const regions = data.regions || [];
+  ctl.card.dataset.status = "done";
+  updateResultTab(ctl.seq, "done");
 
   // 1) head 更新
   const rid = ctl.head.querySelector('[data-role="rid"]');
@@ -966,6 +1109,8 @@ function wirePageCanvas(ctl, pageIdx) {
 }
 
 function markCardError(ctl, msg, wallMs) {
+  ctl.card.dataset.status = "error";
+  updateResultTab(ctl.seq, "error");
   // head: 标红
   const status = ctl.head.querySelector('[data-role="status"]');
   if (status) status.textContent = "失败";
@@ -1065,6 +1210,150 @@ function escapeAttr(s) {
   return String(s ?? "").replace(/"/g, "&quot;");
 }
 
+// ===== 多结果导航 (result-switcher) =====
+function addResultTab(seq, item) {
+  const tab = document.createElement("div");
+  tab.className = "rs-tab active";  // 最新添加的默认 active
+  tab.dataset.seq = seq;
+  // 缩略图：单图用 fileUrl, PDF 用第一页 preview b64
+  let thumbSrc = "";
+  if (item.isPdf && item.previewPages[0]) {
+    thumbSrc = item.previewPages[0].b64;
+  } else if (item.fileUrl) {
+    thumbSrc = item.fileUrl;
+  }
+  const statusText = { pending: "待处理", processing: "处理中", done: "完成", error: "失败" }[item.status] || "处理中";
+  tab.innerHTML = `
+    ${thumbSrc ? `<img class="rs-tab-thumb" src="${escapeAttr(thumbSrc)}" alt="" />` : `<div class="rs-tab-thumb" style="display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--fg-dim);">${item.isPdf ? "PDF" : "IMG"}</div>`}
+    <div class="rs-tab-text">
+      <div class="rs-tab-num">#${seq}</div>
+      <div class="rs-tab-name" title="${escapeAttr(item.file.name)}">${escapeHtml(item.file.name)}</div>
+    </div>
+    <span class="rs-tab-status ${item.status}">${statusText}</span>
+  `;
+  tab.addEventListener("click", () => scrollToResult(seq));
+  // 取消之前的 active（最新加的在最前）
+  rsTabs.querySelectorAll(".rs-tab.active").forEach(t => t.classList.remove("active"));
+  rsTabs.appendChild(tab);
+  updateResultSwitcherNav();
+  // 滚动 tabs 到可见
+  tab.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+}
+
+function updateResultTab(seq, status) {
+  const tab = rsTabs.querySelector(`.rs-tab[data-seq="${seq}"]`);
+  if (!tab) return;
+  const statusEl = tab.querySelector(".rs-tab-status");
+  if (statusEl) {
+    statusEl.classList.remove("processing", "done", "error");
+    statusEl.classList.add(status);
+    statusEl.textContent = { processing: "处理中", done: "完成", error: "失败" }[status] || status;
+  }
+}
+
+function updateResultSwitcherNav() {
+  const all = Array.from(resultList.children);
+  const n = all.length;
+  rs.classList.toggle("show", n > 0);
+  rsInfo.textContent = `${n} / ${n}`;
+  rsPrev.disabled = true;  // scrollToResult 用 scrollIntoView, prev/next 暂简化
+  rsNext.disabled = true;
+}
+
+function scrollToResult(seq) {
+  const card = resultList.querySelector(`.result-card[data-seq="${seq}"]`);
+  if (!card) return;
+  // 滚动到该卡片（顶部留给 sticky header + switcher）
+  const rect = card.getBoundingClientRect();
+  const top = rect.top + window.scrollY - 110;
+  window.scrollTo({ top, behavior: "smooth" });
+  // 高亮闪烁
+  card.classList.remove("scroll-target");
+  void card.offsetWidth;  // 强制重排重启动画
+  card.classList.add("scroll-target");
+  setTimeout(() => card.classList.remove("scroll-target"), 1500);
+  // 更新 active 状态
+  rsTabs.querySelectorAll(".rs-tab").forEach(t => t.classList.toggle("active", Number(t.dataset.seq) === seq));
+}
+
+rsPrev.addEventListener("click", () => {
+  const all = Array.from(resultList.children);
+  const cur = rsTabs.querySelector(".rs-tab.active");
+  if (!cur || all.length === 0) return;
+  const curIdx = all.findIndex(c => Number(c.dataset.seq) === Number(cur.dataset.seq));
+  if (curIdx > 0) scrollToResult(Number(all[curIdx - 1].dataset.seq));
+});
+rsNext.addEventListener("click", () => {
+  const all = Array.from(resultList.children);
+  const cur = rsTabs.querySelector(".rs-tab.active");
+  if (!cur || all.length === 0) return;
+  const curIdx = all.findIndex(c => Number(c.dataset.seq) === Number(cur.dataset.seq));
+  if (curIdx < all.length - 1) scrollToResult(Number(all[curIdx + 1].dataset.seq));
+});
+
+function clearAllResultTabs() {
+  rsTabs.innerHTML = "";
+  rs.classList.remove("show");
+  rsInfo.textContent = "0 / 0";
+}
+
+// ===== 心跳 / 释放 (user presence) =====
+async function sendHeartbeat() {
+  if (activeUserIds.size === 0) return;
+  // 用 sendBeacon 也行，但 sendBeacon 不能指定 Content-Type
+  // 这里用 fetch keepalive 单个端点
+  for (const uid of activeUserIds) {
+    try {
+      await fetch("/api/heartbeat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: uid }),
+        keepalive: true,
+      });
+    } catch (e) {
+      // 忽略网络错误，cleanup 协程会兜底
+    }
+  }
+}
+
+function startHeartbeat() {
+  if (hbTimer) return;
+  hbTimer = setInterval(sendHeartbeat, HB_INTERVAL_MS);
+}
+
+function stopHeartbeat() {
+  if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+}
+
+function releaseAllUsers() {
+  if (activeUserIds.size === 0) return;
+  // 用 sendBeacon 异步发, 浏览器 close 也能送达
+  const ids = Array.from(activeUserIds);
+  for (const uid of ids) {
+    try {
+      const blob = new Blob([JSON.stringify({ user_id: uid })], { type: "application/json" });
+      navigator.sendBeacon("/api/release", blob);
+    } catch (e) { /* ignore */ }
+  }
+  activeUserIds.clear();
+}
+
+// tab 关 / 页面切走时主动 release
+window.addEventListener("pagehide", releaseAllUsers);
+window.addEventListener("beforeunload", releaseAllUsers);
+// 切到后台 tab 时（visibilitychange）也发一次 release — 防止刷新卡住
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    // 不释放, 只发最后一次心跳避免 cleanup 误判
+    sendHeartbeat();
+  } else if (document.visibilityState === "visible") {
+    // 回到前台立即发心跳
+    sendHeartbeat();
+  }
+});
+
+startHeartbeat();
+
 // ===== 清空结果 =====
 function updateClearResultsBtn() {
   const has = resultList.children.length > 0;
@@ -1077,7 +1366,9 @@ clearResultsBtn.addEventListener("click", () => {
   resultList.querySelectorAll("img[src^='blob:']").forEach(img => URL.revokeObjectURL(img.src));
   resultList.innerHTML = "";
   empty.style.display = "";
+  clearAllResultTabs();
   updateClearResultsBtn();
+  // 注意：activeUserIds 不在这里清 — 完成的任务的 user_id 还可能再被刷新页面前端使用
 });
 const resultObserver = new MutationObserver(updateClearResultsBtn);
 resultObserver.observe(resultList, { childList: true });

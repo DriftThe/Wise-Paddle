@@ -723,6 +723,12 @@ class BatchScheduler:
         * 第一轮：每个 user 各拿 1 张
         * 第二轮：继续从 completed 最小的 user 拿，填满 max_batch
         * 效果：长任务（PDF 多页）不会独占 batch，新来的小任务能立刻被分到
+
+    心跳/释放 (tab presence)：
+        * heartbeat(user_id) — 记录 last_heartbeat 时间
+        * release_user(user_id) — 把该 user 的所有 pending job 取消（Future 抛 CancelledError）
+        * _cleanup_loop — 后台协程每 5s 检查一次，超时未心跳的 user 自动 release
+        * 默认 heartbeat_timeout=30s，前端每 10s 一次心跳，tab 关了会触发主动 release
     """
 
     def __init__(
@@ -731,6 +737,8 @@ class BatchScheduler:
             max_batch: int = 5,
             flush_ms: float = 250.0,
             n_workers: Optional[int] = None,
+            heartbeat_timeout: float = 30.0,
+            cleanup_interval: float = 5.0,
     ) -> None:
         if max_batch < 1:
             raise ValueError("max_batch must be >= 1")
@@ -748,19 +756,34 @@ class BatchScheduler:
         self._wakeup = asyncio.Event()
         self._closed = False
         self._worker_tasks: list[asyncio.Task] = []
+        # 心跳/释放
+        self.heartbeat_timeout = float(heartbeat_timeout)
+        self.cleanup_interval = float(cleanup_interval)
+        self._user_heartbeat: dict[str, float] = {}
+        self._released: set[str] = set()  # 已主动 release 但 pipeline 还在跑的 user
+        self._cleanup_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         logger.info(
-            "BatchScheduler starting %d worker(s), max_batch=%d, flush=%.0fms (max-min fair)",
+            "BatchScheduler starting %d worker(s), max_batch=%d, flush=%.0fms "
+            "(max-min fair, hb_timeout=%.0fs)",
             self.n_workers, self.max_batch, self.flush_seconds * 1000,
+            self.heartbeat_timeout,
         )
         for i in range(self.n_workers):
             self._worker_tasks.append(asyncio.create_task(self._worker_loop(i)))
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         logger.info("BatchScheduler ready")
 
     async def close(self) -> None:
         self._closed = True
         self._wakeup.set()  # 唤醒所有 worker 让它们看到 _closed
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except (asyncio.CancelledError, Exception):
+                pass
         for t in self._worker_tasks:
             t.cancel()
         for t in self._worker_tasks:
@@ -769,6 +792,8 @@ class BatchScheduler:
             except (asyncio.CancelledError, Exception):
                 pass
         self._worker_tasks.clear()
+        # 关闭时取消所有 pending 任务
+        await self._cancel_all_pending("scheduler closed")
         logger.info("BatchScheduler closed")
 
     def submit(self, request_id: str, page_index: int, image: Image.Image) -> Job:
@@ -783,11 +808,78 @@ class BatchScheduler:
             self._user_order.append(request_id)
         self._user_pending[request_id].append(job)
         self._pending_count += 1
+        # 第一次见到这个 user 就记一次心跳（防 release 误判）
+        self._user_heartbeat[request_id] = time.monotonic()
         self._wakeup.set()
         return job
 
     def pending_size(self) -> int:
         return self._pending_count
+
+    def heartbeat(self, request_id: str) -> None:
+        """前端每 N 秒发一次心跳；后台 cleanup 协程根据心跳时间判断 user 是否还在线。"""
+        self._user_heartbeat[request_id] = time.monotonic()
+        # 如果之前被 release 过又被前端认领，清掉 released 标记
+        self._released.discard(request_id)
+
+    def release_user(self, request_id: str, reason: str = "tab closed") -> int:
+        """把指定 user 的所有 pending job 取消（Future 抛 CancelledError）。
+        已 in-flight（worker 已 take 走）的 job 不动，等其自然完成后再把 result 丢掉。
+        返回被取消的 job 数。
+        """
+        return self._cancel_user_pending(request_id, reason)
+
+    def _cancel_user_pending(self, user: str, reason: str) -> int:
+        """实际取消 user pending queue 的所有 job。线程安全（仅操作同步状态）。"""
+        q = self._user_pending.get(user)
+        n = 0
+        if q:
+            while q:
+                job = q.pop()
+                if not job.fut.done():
+                    job.fut.cancel(reason)
+                n += 1
+            del self._user_pending[user]
+            self._pending_count -= n
+            if self._pending_count < 0:
+                self._pending_count = 0
+        # 无论是否有 pending, 都从 heartbeat 表移除 + 记 released,
+        # 否则 health 还会以为 user 活跃
+        self._user_heartbeat.pop(user, None)
+        self._released.add(user)
+        # 唤醒所有 worker 重新检查 pending_count
+        self._wakeup.set()
+        if n:
+            logger.info("scheduler released user=%s, cancelled %d pending job(s) (%s)",
+                        user, n, reason)
+        return n
+
+    async def _cancel_all_pending(self, reason: str) -> None:
+        users = list(self._user_pending.keys())
+        for u in users:
+            self._cancel_user_pending(u, reason)
+
+    async def _cleanup_loop(self) -> None:
+        """后台守护协程：定期检查心跳超时的 user，释放它们的 pending job。"""
+        try:
+            while not self._closed:
+                await asyncio.sleep(self.cleanup_interval)
+                if self._closed:
+                    break
+                now = time.monotonic()
+                expired: list[str] = []
+                for u, last in list(self._user_heartbeat.items()):
+                    if u in self._released:
+                        continue
+                    if now - last > self.heartbeat_timeout:
+                        expired.append(u)
+                for u in expired:
+                    self._cancel_user_pending(u, reason=f"heartbeat timeout ({self.heartbeat_timeout}s)")
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("cleanup_loop crashed")
+            raise
 
     def _take_fair_batch(self, max_n: int) -> list:
         """max-min fair 选 batch：优先选 '已完成数最少' 的 user。
