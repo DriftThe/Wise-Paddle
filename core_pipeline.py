@@ -37,7 +37,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import AsyncIterator, Callable, Iterable, Optional, Sequence
-
+import collections
 import numpy as np
 import torch
 from PIL import Image
@@ -228,17 +228,31 @@ class LayoutDetector:
 # 2) Box filter —— NMS + 面积 / 分数门槛
 # ─────────────────────────────────────────────────────────────────────────────
 class BoxFilter:
-    """纯 numpy NMS + 过滤；不依赖额外库。"""
+    """纯 numpy NMS + 过滤；不依赖额外库。
+
+    可调精度参数（影响 layout 召回/裁剪质量）：
+    - iou_threshold:  NMS 重叠上限（越大越激进去重）
+    - min_area:       最小框面积（像素²）
+    - min_score:      最低置信度
+    - unclip_ratio:   NMS 后把框向外扩的比例（0.05 = 每边扩 5%）。给 VL 更多上下文，
+                     提升 OCR 准确率；过大会把别的 region 也包进来。doclayout 边界
+                     偏紧时这个最有用。
+    - expand_pixels:  每边再多扩 N 个像素（绝对值）。和 ratio 叠加生效。
+    """
 
     def __init__(
             self,
             iou_threshold: float = 0.5,
             min_area: float = 16 * 16,
             min_score: float = 0.5,
+            unclip_ratio: float = 0.0,
+            expand_pixels: float = 0.0,
     ) -> None:
-        self.iou_threshold = iou_threshold
-        self.min_area = min_area
-        self.min_score = min_score
+        self.iou_threshold = float(iou_threshold)
+        self.min_area = float(min_area)
+        self.min_score = float(min_score)
+        self.unclip_ratio = float(unclip_ratio)
+        self.expand_pixels = float(expand_pixels)
 
     def _iou(self, a: np.ndarray, b: np.ndarray) -> float:
         ax1, ay1, ax2, ay2 = a
@@ -250,7 +264,22 @@ class BoxFilter:
         union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
         return inter / union if union > 0 else 0.0
 
-    def filter(self, boxes: list[LayoutBox]) -> list[LayoutBox]:
+    def _unclip(self, box: np.ndarray) -> np.ndarray:
+        """按 ratio + 绝对像素把框向外扩，返回 (x1,y1,x2,y2)。"""
+        x1, y1, x2, y2 = box
+        w = x2 - x1
+        h = y2 - y1
+        dx = w * self.unclip_ratio + self.expand_pixels
+        dy = h * self.unclip_ratio + self.expand_pixels
+        return np.array([x1 - dx, y1 - dy, x2 + dx, y2 + dy], dtype=np.float32)
+
+    def filter(
+            self, boxes: list[LayoutBox], page_size: tuple[int, int] | None = None
+    ) -> list[LayoutBox]:
+        """过滤 + NMS + 可选 unclip。
+
+        page_size: (W, H) 可选；给 unclip 提供边界 clamp（防止扩出图外）。
+        """
         # 先按分数从高到低
         keep: list[LayoutBox] = []
         candidates = sorted(boxes, key=lambda b: b.score, reverse=True)
@@ -259,6 +288,21 @@ class BoxFilter:
                 continue
             if any(self._iou(b.xyxy, k.xyxy) > self.iou_threshold for k in keep):
                 continue
+            # unclip：在 NMS 之后，避免影响 NMS 决策
+            if self.unclip_ratio > 0 or self.expand_pixels > 0:
+                expanded = self._unclip(b.xyxy).copy()
+                if page_size is not None:
+                    W, H = page_size
+                    expanded[0] = max(0.0, expanded[0])
+                    expanded[1] = max(0.0, expanded[1])
+                    expanded[2] = min(float(W), expanded[2])
+                    expanded[3] = min(float(H), expanded[3])
+                b = LayoutBox(
+                    xyxy=expanded,
+                    label_id=b.label_id,
+                    label_name=b.label_name,
+                    score=b.score,
+                )
             keep.append(b)
         return keep
 
@@ -317,9 +361,12 @@ class VLPredictor:
             prompts: Optional[dict[str, str]] = None,
             dtype: torch.dtype = torch.bfloat16,
             max_new_tokens: int = 256,
-            max_pixels: int = 1280 * 28 * 28,  # 官方默认 1MP
-            max_forward_batch: int = 10,  # 单次 VL forward 最多 image 数（显存上限）
+            max_pixels: int = 1280 * 28 * 28,  # 官方默认 1MP（longest_edge）
+            min_pixels: int = 112896,         # 官方默认 shortest_edge
+            max_forward_batch: int = 10,       # 单次 VL forward 最多 image 数（显存上限）
             attn_impl: str = "sdpa",
+            repetition_penalty: float = 1.15,  # 防止 batch 推理陷入重复循环
+            do_sample: bool = False,           # greedy 解码；想更"活"可以改 True
     ) -> None:
         logger.info("Loading VL model: %s", model_path)
         self.processor = AutoProcessor.from_pretrained(model_path)
@@ -341,12 +388,12 @@ class VLPredictor:
         )
         self.device = device
         self.dtype = dtype
-        self.max_new_tokens = max_new_tokens
-        self.max_pixels = max_pixels
+        self.max_new_tokens = int(max_new_tokens)
+        self.max_pixels = int(max_pixels)
+        self.min_pixels = int(min_pixels)
         self.max_forward_batch = max(1, int(max_forward_batch))
-        # v1.6 image_processor.size = SizeDict(shortest_edge=112896, longest_edge=1003520)
-        # 调用 apply_chat_template 时通过 images_kwargs 覆盖
-        self.shortest_edge = 112896
+        self.repetition_penalty = float(repetition_penalty)
+        self.do_sample = bool(do_sample)
         self.prompts = {**self.DEFAULT_PROMPTS, **(prompts or {})}
         # EOS：模型的 generation_config.json 里写的是 </s> (id=2)
         tok = self.processor.tokenizer
@@ -390,7 +437,7 @@ class VLPredictor:
             padding=True,  # batch 推理要 padding
             images_kwargs={
                 "size": {
-                    "shortest_edge": self.shortest_edge,
+                    "shortest_edge": self.min_pixels,
                     "longest_edge": self.max_pixels,
                 }
             },
@@ -407,11 +454,11 @@ class VLPredictor:
         out = self.model.generate(
             **inputs,
             max_new_tokens=self.max_new_tokens,
-            do_sample=False,
+            do_sample=self.do_sample,
             eos_token_id=self.eos_token_id,
             pad_token_id=self.pad_token_id,
             use_cache=True,
-            repetition_penalty=1.15,
+            repetition_penalty=self.repetition_penalty,
         )
         gen = out[:, inputs["input_ids"].shape[1]:]
         return self.processor.batch_decode(gen, skip_special_tokens=True)
@@ -460,7 +507,10 @@ class VLPredictor:
 # 5) Pipeline —— 把上述 4 步串成一条主干
 # ─────────────────────────────────────────────────────────────────────────────
 class OCRPipeline:
-    """对一张图跑 layout detection → 过滤 → 裁剪 → VL 识别 → 落盘。"""
+    """对一张图跑 layout detection → 过滤 → 裁剪 → VL 识别 → 落盘。
+
+    所有可调精度/速度/显存参数都从构造参数传进来（app.py 从 .env 读）。
+    """
 
     def __init__(
             self,
@@ -468,26 +518,52 @@ class OCRPipeline:
             vl_model_path: str,
             device: torch.device,
             output_dir: Path,
-            box_filter: Optional[BoxFilter] = None,
+            # ---- LayoutDetector ----
             score_threshold: float = 0.5,
+            # ---- BoxFilter ----
+            box_iou_threshold: float = 0.5,
+            box_min_area: float = 16 * 16,
+            box_min_score: float = 0.5,
+            box_unclip_ratio: float = 0.0,    # 0.05 = 每边向外扩 5%，提精度
+            box_expand_pixels: float = 0.0,  # 额外每边扩 N 像素
+            # ---- VLPredictor ----
             max_new_tokens: int = 256,
-            max_regions: int = 100,  # 几乎不限制，让每图所有 region 都进 VL
-            vl_max_forward_batch: int = 4,  # 单次 VL forward image 上限（显存）
+            vl_min_pixels: int = 112896,
+            vl_max_pixels: int = 1280 * 28 * 28,
+            vl_max_forward_batch: int = 4,
+            vl_repetition_penalty: float = 1.15,
+            vl_do_sample: bool = False,
+            # ---- runtime ----
+            max_regions: int = 100,
+            dtype: torch.dtype = torch.bfloat16,
+            attn_impl: str = "sdpa",
     ) -> None:
         self.device = device
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.layout = LayoutDetector(
-            layout_model_path, device, score_threshold=score_threshold
+            layout_model_path, device, score_threshold=score_threshold,
         )
-        self.filter = box_filter or BoxFilter()
+        self.filter = BoxFilter(
+            iou_threshold=box_iou_threshold,
+            min_area=box_min_area,
+            min_score=box_min_score,
+            unclip_ratio=box_unclip_ratio,
+            expand_pixels=box_expand_pixels,
+        )
         self.cropper = RegionCropper()
         self.vl = VLPredictor(
             vl_model_path, device,
             max_new_tokens=max_new_tokens,
+            min_pixels=vl_min_pixels,
+            max_pixels=vl_max_pixels,
             max_forward_batch=vl_max_forward_batch,
+            repetition_penalty=vl_repetition_penalty,
+            do_sample=vl_do_sample,
+            attn_impl=attn_impl,
+            dtype=dtype,
         )
-        self.max_regions = max_regions
+        self.max_regions = int(max_regions)
 
     def _ensure_output_dir(self) -> None:
         """每次处理前都确认根目录在（外部可能 mavis-trash 掉）。"""
@@ -506,8 +582,8 @@ class OCRPipeline:
 
         # 1) layout detection（内部自动 resize）
         layouts = self.layout.detect([image])[0]
-        # 2) 过滤（NMS + 面积 + 分数）
-        kept = self.filter.filter(layouts)
+        # 2) 过滤（NMS + 面积 + 分数 + unclip）—— 传 page_size 让 unclip 不扩出图
+        kept = self.filter.filter(layouts, page_size=(w, h))
         # 2.5) 限制单页最多送进 VL 的 region 数；按分数截断
         kept = kept[: self.max_regions]
         # 3) 裁剪
@@ -589,10 +665,10 @@ class OCRPipeline:
         images_rgb: list[Image.Image] = [j.image.convert("RGB") for j in jobs]
         layouts_per_page = self.layout.detect(images_rgb)
 
-        # 2) 每图独立 filter + crop
+        # 2) 每图独立 filter + crop（page_size 让 unclip clamp 到图内）
         crops_per_page: list[list[tuple[Image.Image, LayoutBox]]] = []
         for image, layouts in zip(images_rgb, layouts_per_page):
-            kept = self.filter.filter(layouts)[: self.max_regions]
+            kept = self.filter.filter(layouts, page_size=(image.width, image.height))[: self.max_regions]
             crops: list[tuple[Image.Image, LayoutBox]] = []
             for box in kept:
                 arr = self.cropper.crop(image, box)
@@ -705,7 +781,7 @@ class PipelinePool:
 # 7) BatchScheduler —— 攒批 + 借 pipeline + 分发结果
 # ─────────────────────────────────────────────────────────────────────────────
 class BatchScheduler:
-    """在 PipelinePool 之上做的"卡车"调度器，按 max-min fairness 拼批：
+    """在 PipelinePool 之上做的调度器，按 max-min fairness 拼批：
 
     - 上游：任意线程/协程 submit(request_id, page_idx, image) → 返回 Future[PageResult]
     - 下游：n_workers 个 worker 协程循环 ——
@@ -724,11 +800,16 @@ class BatchScheduler:
         * 第二轮：继续从 completed 最小的 user 拿，填满 max_batch
         * 效果：长任务（PDF 多页）不会独占 batch，新来的小任务能立刻被分到
 
-    心跳/释放 (tab presence)：
-        * heartbeat(user_id) — 记录 last_heartbeat 时间
-        * release_user(user_id) — 把该 user 的所有 pending job 取消（Future 抛 CancelledError）
-        * _cleanup_loop — 后台协程每 5s 检查一次，超时未心跳的 user 自动 release
-        * 默认 heartbeat_timeout=30s，前端每 10s 一次心跳，tab 关了会触发主动 release
+    取消语义（替代了之前的心跳机制）：
+        * release_user(user_id) — 由 app.py 在以下时机调用：
+          - 前端 pagehide 触发 sendBeacon /api/release
+          - HTTP handler 收到 CancelledError（tab 关 / 网络断 / 服务关闭）
+          一次性清掉该 user 的 pending + 已 in-flight 但还没 set_result 的 fut
+        * _cancel_all_pending — 关闭 scheduler 时清理
+        * 注意：in-flight（worker 已 take 走、process_batch 正在跑）的 job 不能
+          中断，只能让其自然完成；它的 fut 会被 cancel()，process_batch 完成后
+          set_result 不会触发 CancelledError 分支但 fut 已是 cancelled，调用方
+          catch CancelledError 时拿到的是原取消原因。
     """
 
     def __init__(
@@ -737,8 +818,6 @@ class BatchScheduler:
             max_batch: int = 5,
             flush_ms: float = 250.0,
             n_workers: Optional[int] = None,
-            heartbeat_timeout: float = 30.0,
-            cleanup_interval: float = 5.0,
     ) -> None:
         if max_batch < 1:
             raise ValueError("max_batch must be >= 1")
@@ -756,34 +835,20 @@ class BatchScheduler:
         self._wakeup = asyncio.Event()
         self._closed = False
         self._worker_tasks: list[asyncio.Task] = []
-        # 心跳/释放
-        self.heartbeat_timeout = float(heartbeat_timeout)
-        self.cleanup_interval = float(cleanup_interval)
-        self._user_heartbeat: dict[str, float] = {}
-        self._released: set[str] = set()  # 已主动 release 但 pipeline 还在跑的 user
-        self._cleanup_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
         logger.info(
             "BatchScheduler starting %d worker(s), max_batch=%d, flush=%.0fms "
-            "(max-min fair, hb_timeout=%.0fs)",
+            "(max-min fair)",
             self.n_workers, self.max_batch, self.flush_seconds * 1000,
-            self.heartbeat_timeout,
         )
         for i in range(self.n_workers):
             self._worker_tasks.append(asyncio.create_task(self._worker_loop(i)))
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         logger.info("BatchScheduler ready")
 
     async def close(self) -> None:
         self._closed = True
         self._wakeup.set()  # 唤醒所有 worker 让它们看到 _closed
-        if self._cleanup_task is not None:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except (asyncio.CancelledError, Exception):
-                pass
         for t in self._worker_tasks:
             t.cancel()
         for t in self._worker_tasks:
@@ -808,19 +873,15 @@ class BatchScheduler:
             self._user_order.append(request_id)
         self._user_pending[request_id].append(job)
         self._pending_count += 1
-        # 第一次见到这个 user 就记一次心跳（防 release 误判）
-        self._user_heartbeat[request_id] = time.monotonic()
         self._wakeup.set()
         return job
 
     def pending_size(self) -> int:
         return self._pending_count
 
-    def heartbeat(self, request_id: str) -> None:
-        """前端每 N 秒发一次心跳；后台 cleanup 协程根据心跳时间判断 user 是否还在线。"""
-        self._user_heartbeat[request_id] = time.monotonic()
-        # 如果之前被 release 过又被前端认领，清掉 released 标记
-        self._released.discard(request_id)
+    def active_user_count(self) -> int:
+        """当前还有 pending job 的 user 数（不算 in-flight 已被 worker 拿走的）。"""
+        return len(self._user_pending)
 
     def release_user(self, request_id: str, reason: str = "tab closed") -> int:
         """把指定 user 的所有 pending job 取消（Future 抛 CancelledError）。
@@ -843,10 +904,6 @@ class BatchScheduler:
             self._pending_count -= n
             if self._pending_count < 0:
                 self._pending_count = 0
-        # 无论是否有 pending, 都从 heartbeat 表移除 + 记 released,
-        # 否则 health 还会以为 user 活跃
-        self._user_heartbeat.pop(user, None)
-        self._released.add(user)
         # 唤醒所有 worker 重新检查 pending_count
         self._wakeup.set()
         if n:
@@ -858,28 +915,6 @@ class BatchScheduler:
         users = list(self._user_pending.keys())
         for u in users:
             self._cancel_user_pending(u, reason)
-
-    async def _cleanup_loop(self) -> None:
-        """后台守护协程：定期检查心跳超时的 user，释放它们的 pending job。"""
-        try:
-            while not self._closed:
-                await asyncio.sleep(self.cleanup_interval)
-                if self._closed:
-                    break
-                now = time.monotonic()
-                expired: list[str] = []
-                for u, last in list(self._user_heartbeat.items()):
-                    if u in self._released:
-                        continue
-                    if now - last > self.heartbeat_timeout:
-                        expired.append(u)
-                for u in expired:
-                    self._cancel_user_pending(u, reason=f"heartbeat timeout ({self.heartbeat_timeout}s)")
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            logger.exception("cleanup_loop crashed")
-            raise
 
     def _take_fair_batch(self, max_n: int) -> list:
         """max-min fair 选 batch：优先选 '已完成数最少' 的 user。

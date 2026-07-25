@@ -510,7 +510,7 @@
     <label class="drop-zone" id="drop-zone">
       <input type="file" id="file-input" accept="image/*,application/pdf" multiple />
       <div>把图片 / PDF 拖到这里，或者 <strong>点我选择</strong></div>
-      <div class="hint">支持 PNG / JPG / WebP · PDF（多页自动拆任务）· 多选 OK</div>
+      <div class="hint">支持 PNG / JPG / WebP / PDF</div>
     </label>
 
     <div class="queue-section" id="queue-section" style="display:none;">
@@ -570,10 +570,10 @@ const rsNext = $("#rs-next");
 const rsInfo = $("#rs-info");
 let resultSeq = 0;
 // user_id → request_id 映射; 每个 queue item 一个 user_id
-// 用于 heartbeat 和 tab close 时的 release
+// 当前还在处理的 user_id 集合（处理完移除；pagehide 时 sendBeacon 一次性 release）
+// 当前还在处理的 user_id 集合（用于 pagehide 时 sendBeacon 一次性释放）
+// 注意：服务端不再依赖心跳；只在 pagehide/beforeunload/visibilitychange→hidden 时释放
 const activeUserIds = new Set();
-let hbTimer = null;
-const HB_INTERVAL_MS = 10_000;
 
 // ===== 队列状态 =====
 /**
@@ -761,12 +761,8 @@ async function processOne(item) {
   const t0 = performance.now();
   // 1) 立即建一个"处理中"placeholder card
   const ctl = buildPlaceholderCard(item);
-  // 2) 申请一个 user_id（= 首次返回的 request_id 不可知, 先用 client-side 临时 ID,
-  //    server 在响应里返回真实 request_id 后, 我们用 sendBeacon 重新注册
-  //    简化做法: 用 client 临时 ID, 服务端 scheduler.submit 时也用同一个 ID 做 heartbeat
-  //    —— 但 server OCRResponse 里的 request_id 才是 server 视角的 ID, 我们需要让 server 关联
-  //    解决: 改 API 让客户端传 user_id 进来, server submit 时用同一个
-  //    -- 改动见 demo.py: ocr_upload / ocr_pdf 支持 user_id from query/header
+  // 2) 申请一个 client-side user_id, 通过 query string 传给服务端
+  //    (服务端用这个 user_id 做 scheduler key + release 标识)
   const clientUserId = `web-${uid()}`;
   activeUserIds.add(clientUserId);
   try {
@@ -790,11 +786,21 @@ async function processOne(item) {
       return;
     }
     const data = await r.json();
-    item.status = "done";
+    // 队列状态切到 processing
+    item.status = "processing";
     renderQueue();
-    // 任务完成, 不再需要心跳 + 释放
-    activeUserIds.delete(clientUserId);
-    fillCardWithResult(ctl, item, data, wallMs);
+    // 区分 PDF 异步流式 vs 单图同步
+    if (item.isPdf && data.total_pages && data.poll_url) {
+      // PDF: 后台跑批, 走轮询路径
+      pollPdfProgress(ctl, item, clientUserId, data, t0);
+    } else {
+      // 单图 / base64: 同步响应, 立即填充
+      const wallMs = performance.now() - t0;
+      item.status = "done";
+      renderQueue();
+      activeUserIds.delete(clientUserId);
+      fillCardWithResult(ctl, item, data, wallMs);
+    }
   } catch (e) {
     item.status = "error";
     renderQueue();
@@ -805,6 +811,156 @@ async function processOne(item) {
       navigator.sendBeacon("/api/release", blob);
     } catch (e) {}
   }
+}
+
+/**
+ * PDF 流式轮询: 每 1.5s 拉一次 /api/ocr/pdf-status/{user_id},
+ * 每收到新 page 立即更新对应 page-slot (而不是等所有 page 跑完).
+ * 全部 done 后停止轮询.
+ */
+async function pollPdfProgress(ctl, item, userId, initData, t0) {
+  const totalPages = initData.total_pages;
+  const pollUrl = initData.poll_url;
+  const filledPages = new Set();
+
+  // head 更新
+  const rid = ctl.head.querySelector('[data-role="rid"]');
+  if (rid) rid.textContent = (userId || "").replace(/^web-/, "");
+  const pageinfo = ctl.head.querySelector('[data-role="pageinfo"]');
+  if (pageinfo) pageinfo.textContent = `0 / ${totalPages} 页 · 处理中…`;
+  const status = ctl.head.querySelector('[data-role="status"]');
+  if (status) status.textContent = "处理中";
+
+  const tick = async () => {
+    try {
+      const r = await fetch(pollUrl, { cache: "no-store" });
+      if (!r.ok) { setTimeout(tick, 1500); return; }
+      const data = await r.json();
+
+      // 处理每个新 page (后端返回所有已完成页，前端用 filledPages 去重)
+      const pageIds = Object.keys(data.pages || {}).map(Number).sort((a, b) => a - b);
+      for (const pidx of pageIds) {
+        if (filledPages.has(pidx)) continue;
+        const pageData = data.pages[pidx];
+        fillOnePageSlot(ctl, item, pidx, pageData);
+        filledPages.add(pidx);
+        // 切对应 page-slot 状态为 done, chip 状态为 done
+        if (ctl.pageSlots[pidx]) ctl.pageSlots[pidx].dataset.status = "done";
+        if (ctl.chips) {
+          const chip = ctl.chips.querySelector(`.page-chip[data-page-index="${pidx}"]`);
+          if (chip) { chip.classList.remove("processing"); chip.classList.add("done"); }
+        }
+      }
+
+      // 更新 head 计数
+      const doneCount = data.done_count || filledPages.size;
+      const phaseLabel = data.cancelled ? "已取消" : (data.done ? "完成" : "处理中");
+      if (pageinfo) pageinfo.textContent = `${doneCount} / ${totalPages} 页 · ${data.done ? "完成" : "处理中…"}`;
+      if (status) status.textContent = `${phaseLabel} ${doneCount}/${totalPages}`;
+
+      if (data.done || data.cancelled || data.error) {
+        const wallMs = performance.now() - t0;
+        item.status = (data.cancelled || data.error) ? "error" : "done";
+        renderQueue();
+        activeUserIds.delete(userId);
+        if (data.error) {
+          markCardError(ctl, data.error, wallMs);
+        } else if (data.cancelled) {
+          markCardError(ctl, "客户端取消 / 心跳超时", wallMs);
+        }
+        // 切所有未完成 page-slot 状态
+        for (let i = 0; i < ctl.totalPages; i++) {
+          if (!filledPages.has(i)) {
+            if (ctl.pageSlots[i]) {
+              ctl.pageSlots[i].dataset.status = (data.cancelled || data.error) ? "error" : "waiting";
+            }
+            if (ctl.chips) {
+              const chip = ctl.chips.querySelector(`.page-chip[data-page-index="${i}"]`);
+              if (chip) {
+                chip.classList.remove("processing");
+                if (data.cancelled || data.error) chip.classList.add("error");
+              }
+            }
+          }
+        }
+        // timing 更新
+        const big = ctl.head.querySelector('[data-role="server"]');
+        if (big) {
+          big.classList.remove("processing");
+          if (data.cancelled || data.error) {
+            big.classList.add("error");
+            big.textContent = data.cancelled ? "取消" : "失败";
+          } else {
+            big.innerHTML = `${(wallMs / 1000).toFixed(2)}<span style="font-size:14px;color:var(--fg-dim);">s</span>`;
+          }
+        }
+        const wallEl = ctl.head.querySelector('[data-role="wall"]');
+        if (wallEl) wallEl.textContent = `${(wallMs / 1000).toFixed(2)}s`;
+        return;  // 停止轮询
+      }
+      setTimeout(tick, 1500);
+    } catch (e) {
+      setTimeout(tick, 2500);  // 网络错误慢点重试
+    }
+  };
+  tick();
+}
+
+/**
+ * 单 page 增量更新: 把一个已完成 page 的 OCR 结果填到对应 page-slot
+ */
+function fillOnePageSlot(ctl, item, pageIndex, pageData) {
+  const isPdf = item.isPdf;
+  const slot = ctl.pageSlots[pageIndex];
+  if (!slot) return;
+  // 替换 image src 为 server 返回的图 (替换原 PDF preview)
+  const finalSrc = pageData.image_b64
+    ? `data:image/png;base64,${pageData.image_b64}`
+    : (isPdf && item.previewPages[pageIndex] ? item.previewPages[pageIndex].b64 : (item.fileUrl || ""));
+  const finalW = pageData.width || (item.previewPages[pageIndex] && item.previewPages[pageIndex].w) || 0;
+  const finalH = pageData.height || (item.previewPages[pageIndex] && item.previewPages[pageIndex].h) || 0;
+  const wrap = slot.querySelector('[data-role="wrap"]');
+  if (wrap) {
+    wrap.dataset.imgB64 = finalSrc;
+    wrap.dataset.w = String(finalW);
+    wrap.dataset.h = String(finalH);
+    wrap.dataset.status = "done";
+    const oldImg = wrap.querySelector("img");
+    if (finalSrc) {
+      if (oldImg) oldImg.src = finalSrc;
+      else {
+        const img = document.createElement("img");
+        img.src = finalSrc;
+        const cv = wrap.querySelector("canvas");
+        if (cv) wrap.insertBefore(img, cv);
+        else wrap.appendChild(img);
+      }
+    }
+  }
+  // 填 region 卡片
+  const regionsEl = slot.querySelector(`[data-role="regions-${pageIndex}"]`);
+  const pageRegions = pageData.regions || [];
+  if (regionsEl) {
+    if (pageRegions.length === 0) {
+      regionsEl.innerHTML = `<div class="empty-state" style="grid-column:1/-1;padding:12px;">未检测到任何区域</div>`;
+    } else {
+      regionsEl.innerHTML = pageRegions.map((r, j) => `
+        <div class="region" data-idx="${j}" data-page="${pageIndex}" data-label="${escapeHtml(r.label)}"
+             data-rect="${r.rect.join(",")}" data-score="${r.score}">
+          <div class="r-head">
+            <span class="r-label">${escapeHtml(r.label)}</span>
+            <span class="r-score">${(r.score * 100).toFixed(1)}% · #${j}</span>
+          </div>
+          <div class="r-text">${escapeHtml(r.markdown || "")}</div>
+          <div class="r-hint">悬停框即复制</div>
+        </div>`).join("");
+    }
+  }
+  // wire canvas 检测框 + hover-copy
+  if (typeof wirePageCanvas === "function") wirePageCanvas(ctl, pageIndex);
+  ctl.card.dataset.status = "done";
+  // 更新 tab 状态
+  if (typeof updateResultTab === "function") updateResultTab(ctl.seq, "done");
 }
 
 // ===== Result card 构造 =====
@@ -902,6 +1058,8 @@ function buildPlaceholderCard(item) {
     pageSlots.push(slot);
   }
 
+  // 存储每页的 canvas 重绘函数（issue#2: 页面切换时触发重绘）
+  const _pageRedraws = {};
   resultList.prepend(card);
   updateClearResultsBtn();
 
@@ -915,6 +1073,12 @@ function buildPlaceholderCard(item) {
       chips.querySelectorAll(".page-chip").forEach((c, i) => c.classList.toggle("active", i === idx));
       if (info) info.textContent = `${idx + 1} / ${totalPages}`;
     }
+    // 页面切换后触发 canvas 重绘（修复隐藏页 canvas 尺寸为 0 的问题）
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (_pageRedraws[idx]) _pageRedraws[idx]();
+      });
+    });
   };
   // 默认显示 page 0
   if (chips) {
@@ -922,7 +1086,7 @@ function buildPlaceholderCard(item) {
     if (c0) c0.classList.add("active");
   }
 
-  return { card, head, nav, chips, info, pageSlots, totalPages, showPage, seq };
+  return { card, head, nav, chips, info, pageSlots, totalPages, showPage, seq, _pageRedraws };
 }
 
 /**
@@ -967,11 +1131,13 @@ function fillCardWithResult(ctl, item, data, wallMs) {
   }
 
   // 3) 每个 page-slot 切到 done 状态
-  for (let i = 0; i < ctl.totalPages; i++) {
+  const safeN = Math.min(ctl.totalPages, ctl.pageSlots.length);
+  for (let i = 0; i < safeN; i++) {
     const slot = ctl.pageSlots[i];
+    if (!slot) continue;
     slot.dataset.status = "done";
-    const p = data.pages[i];
-    const preview = isPdf ? item.previewPages[i] : null;
+    const p = (data.pages && i < data.pages.length) ? data.pages[i] : null;
+    const preview = isPdf ? (item.previewPages || [])[i] : null;
     const finalSrc = (p && p.image_b64) ? `data:image/png;base64,${p.image_b64}` : (preview ? preview.b64 : (item.fileUrl || ""));
     const finalW = (p && p.width) || (preview && preview.w) || 0;
     const finalH = (p && p.height) || (preview && preview.h) || 0;
@@ -988,7 +1154,9 @@ function fillCardWithResult(ctl, item, data, wallMs) {
         } else {
           const img = document.createElement("img");
           img.src = finalSrc;
-          wrap.insertBefore(img, wrap.querySelector("canvas"));
+          const canvasEl = wrap.querySelector("canvas");
+          if (canvasEl) wrap.insertBefore(img, canvasEl);
+          else wrap.appendChild(img);
         }
       } else {
         const ph = wrap.querySelector("div");
@@ -1025,6 +1193,11 @@ function fillCardWithResult(ctl, item, data, wallMs) {
     // wire canvas 检测框 + hover-copy
     wirePageCanvas(ctl, i);
   }
+  // 如果 slot 比实际资料多，剩下的也标 done（带预览图）
+  for (let i = safeN; i < ctl.totalPages; i++) {
+    const slot = ctl.pageSlots[i];
+    if (slot) slot.dataset.status = "done";
+  }
 }
 
 function wirePageCanvas(ctl, pageIdx) {
@@ -1046,6 +1219,7 @@ function wirePageCanvas(ctl, pageIdx) {
   const setup = () => {
     const dpr = window.devicePixelRatio || 1;
     const r = wrap.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return; // 隐藏页跳过（等 showPage 触发重绘）
     canvas.width = Math.round(r.width * dpr);
     canvas.height = Math.round(r.height * dpr);
     canvas.style.width = r.width + "px";
@@ -1055,6 +1229,9 @@ function wirePageCanvas(ctl, pageIdx) {
     drawBoxes(ctx, regionData, parseInt(wrap.dataset.w), parseInt(wrap.dataset.h), r.width, r.height, -1);
   };
 
+  // 存储重绘函数供 showPage 切换页面时调用（修复隐藏页 canvas 尺寸为 0 的问题）
+  if (ctl._pageRedraws) ctl._pageRedraws[pageIdx] = setup;
+
   if (img && img.complete && img.naturalWidth > 0) {
     setup();
   } else if (img) {
@@ -1062,7 +1239,10 @@ function wirePageCanvas(ctl, pageIdx) {
   }
   requestAnimationFrame(() => requestAnimationFrame(setup));
   if (!ctl.card._resizeBound) {
-    window.addEventListener("resize", setup);
+    window.addEventListener("resize", () => {
+      // 窗口缩放时重绘所有已注册的页（仅当前可见页会实际绘制）
+      Object.values(ctl._pageRedraws).forEach(fn => fn());
+    });
     ctl.card._resizeBound = true;
   }
 
@@ -1297,37 +1477,15 @@ function clearAllResultTabs() {
   rsInfo.textContent = "0 / 0";
 }
 
-// ===== 心跳 / 释放 (user presence) =====
-async function sendHeartbeat() {
-  if (activeUserIds.size === 0) return;
-  // 用 sendBeacon 也行，但 sendBeacon 不能指定 Content-Type
-  // 这里用 fetch keepalive 单个端点
-  for (const uid of activeUserIds) {
-    try {
-      await fetch("/api/heartbeat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: uid }),
-        keepalive: true,
-      });
-    } catch (e) {
-      // 忽略网络错误，cleanup 协程会兜底
-    }
-  }
-}
-
-function startHeartbeat() {
-  if (hbTimer) return;
-  hbTimer = setInterval(sendHeartbeat, HB_INTERVAL_MS);
-}
-
-function stopHeartbeat() {
-  if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
-}
-
+// ===== 释放 (pagehide 显式 release, 不再依赖心跳) =====
+// 之前的实现是每 10s 发心跳 + 30s 超时 cleanup；现在简化为：
+//   - 处理中 → 把 user_id 加进 activeUserIds
+//   - 处理完 → 从 activeUserIds 移除
+//   - pagehide / beforeunload → sendBeacon 一次性 release 所有还在 active 的
+//   - visibilitychange hidden → 立即 release（避免浏览器强杀时漏发）
 function releaseAllUsers() {
   if (activeUserIds.size === 0) return;
-  // 用 sendBeacon 异步发, 浏览器 close 也能送达
+  // sendBeacon 异步 POST, 即使 tab 正在被关也能送达
   const ids = Array.from(activeUserIds);
   for (const uid of ids) {
     try {
@@ -1341,18 +1499,13 @@ function releaseAllUsers() {
 // tab 关 / 页面切走时主动 release
 window.addEventListener("pagehide", releaseAllUsers);
 window.addEventListener("beforeunload", releaseAllUsers);
-// 切到后台 tab 时（visibilitychange）也发一次 release — 防止刷新卡住
+// 切到后台 tab 时（visibilitychange→hidden）立即 release — 浏览器强杀时
+// pagehide 可能来不及触发，visibilitychange 更可靠
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") {
-    // 不释放, 只发最后一次心跳避免 cleanup 误判
-    sendHeartbeat();
-  } else if (document.visibilityState === "visible") {
-    // 回到前台立即发心跳
-    sendHeartbeat();
+    releaseAllUsers();
   }
 });
-
-startHeartbeat();
 
 // ===== 清空结果 =====
 function updateClearResultsBtn() {
