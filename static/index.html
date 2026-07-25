@@ -1,0 +1,1531 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Wise-Paddle · OCR Playground</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --bg-elev: #161b22;
+    --bg-elev2: #1f2630;
+    --bg-elev3: #2a3441;
+    --fg: #e6edf3;
+    --fg-dim: #8b949e;
+    --border: #30363d;
+    --accent: #58a6ff;
+    --accent-hover: #79b8ff;
+    --success: #3fb950;
+    --warn: #d29922;
+    --danger: #f85149;
+    --box-text: #56d364;
+    --box-image: #ffa657;
+    --box-table: #d2a8ff;
+    --shadow: 0 8px 24px rgba(0,0,0,0.4);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    min-height: 100vh;
+  }
+  body { padding-bottom: 60px; }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+    background: var(--bg-elev); position: sticky; top: 0; z-index: 10;
+  }
+  header h1 {
+    font-size: 15px; font-weight: 600; margin: 0;
+    display: flex; align-items: center; gap: 10px;
+  }
+  header h1 .logo {
+    width: 24px; height: 24px; border-radius: 5px;
+    background: linear-gradient(135deg, var(--accent), var(--box-image));
+    display: inline-block;
+  }
+  header .stats { display: flex; gap: 14px; font-size: 12px; color: var(--fg-dim); }
+  header .stats span b { color: var(--fg); margin-left: 4px; font-weight: 600; }
+
+  main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+
+  .card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    margin-bottom: 16px;
+  }
+
+  /* Drop zone */
+  .drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: 8px;
+    padding: 28px 16px;
+    text-align: center;
+    color: var(--fg-dim);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .drop-zone:hover, .drop-zone.drag-over {
+    border-color: var(--accent);
+    background: var(--bg-elev2);
+    color: var(--fg);
+  }
+  .drop-zone strong { color: var(--accent); }
+  .drop-zone input { display: none; }
+  .drop-zone .hint { font-size: 12px; margin-top: 6px; }
+
+  /* Queue */
+  .queue-section { margin-top: 16px; }
+  .queue-section h2 {
+    font-size: 13px; color: var(--fg-dim); font-weight: 500;
+    margin: 0 0 10px; display: flex; align-items: center; gap: 8px;
+  }
+  .queue-section h2 .count {
+    background: var(--bg-elev3); padding: 2px 8px; border-radius: 4px;
+    font-size: 11px; color: var(--fg); font-family: ui-monospace, Consolas, monospace;
+  }
+  .queue {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 10px;
+  }
+  .queue-item {
+    position: relative;
+    background: var(--bg-elev2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    aspect-ratio: 1;
+  }
+  .queue-item img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+  }
+  .queue-item .file-name {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    padding: 4px 6px;
+    background: linear-gradient(transparent, rgba(0,0,0,0.85));
+    font-size: 10px;
+    color: #fff;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .queue-item .badge {
+    position: absolute; top: 4px; left: 4px;
+    font-size: 10px; padding: 2px 6px; border-radius: 3px;
+    font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px;
+  }
+  .queue-item .badge.pending { background: var(--bg-elev3); color: var(--fg-dim); }
+  .queue-item .badge.processing { background: var(--accent); color: #fff; }
+  .queue-item .badge.done { background: var(--success); color: #fff; }
+  .queue-item .badge.error { background: var(--danger); color: #fff; }
+  .queue-item .pages-tag {
+    position: absolute; top: 4px; right: 30px;
+    font-size: 10px; padding: 2px 6px; border-radius: 3px;
+    background: rgba(0,0,0,0.6); color: #fff;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .queue-item .remove {
+    position: absolute; top: 4px; right: 4px;
+    width: 20px; height: 20px; border-radius: 50%;
+    background: rgba(0,0,0,0.6); color: #fff;
+    border: none; cursor: pointer; font-size: 12px;
+    display: flex; align-items: center; justify-content: center;
+    line-height: 1;
+  }
+  .queue-item .remove:hover { background: var(--danger); }
+  .queue-item.processing::after {
+    content: '';
+    position: absolute; inset: 0;
+    border: 2px solid var(--accent);
+    border-radius: 6px;
+    animation: pulse 1.2s ease-in-out infinite;
+    pointer-events: none;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 1; }
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .actions {
+    display: flex; gap: 10px; align-items: center; margin-top: 14px;
+    flex-wrap: wrap;
+  }
+  .btn {
+    background: var(--accent); color: #fff;
+    border: none; padding: 8px 16px;
+    border-radius: 6px; font-size: 13px; font-weight: 500;
+    cursor: pointer; transition: all 0.15s;
+  }
+  .btn:hover { background: var(--accent-hover); }
+  .btn:disabled {
+    background: var(--bg-elev3); color: var(--fg-dim); cursor: not-allowed;
+  }
+  .btn.ghost {
+    background: transparent; border: 1px solid var(--border); color: var(--fg-dim);
+  }
+  .btn.ghost:hover { background: var(--bg-elev2); color: var(--fg); }
+
+  /* Result card */
+  .result-card {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    margin-bottom: 16px;
+    box-shadow: var(--shadow);
+  }
+  .result-card .head {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: flex-start;
+    gap: 16px; flex-wrap: wrap;
+  }
+  .result-card .title {
+    font-size: 13px; color: var(--fg);
+    display: flex; align-items: center; gap: 8px;
+    flex-wrap: wrap;
+  }
+  .result-card .title strong { color: var(--fg); font-weight: 500; }
+  .result-card .rid {
+    font-size: 11px; color: var(--fg-dim);
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .result-card .timing {
+    display: flex; gap: 16px; align-items: center; flex-wrap: wrap;
+  }
+  .result-card .timing .big {
+    font-size: 24px; font-weight: 700; color: var(--success);
+    font-family: ui-monospace, Consolas, monospace;
+    letter-spacing: -0.5px;
+  }
+  .result-card .timing .big.processing { color: var(--accent); }
+  .result-card .timing .big.error { color: var(--danger); }
+  .result-card .timing .small {
+    font-size: 11px; color: var(--fg-dim);
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .result-card .timing .small b { color: var(--fg); font-weight: 600; }
+
+  /* Page navigator (only when > 1 page) */
+  .page-nav {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 20px;
+    background: var(--bg-elev2);
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+  }
+  .page-nav .nav-btn {
+    background: var(--bg-elev3); color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 4px 10px; border-radius: 4px;
+    font-size: 12px; cursor: pointer;
+    flex-shrink: 0;
+  }
+  .page-nav .nav-btn:hover { background: var(--accent); color: #fff; }
+  .page-nav .nav-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .page-nav .page-chips {
+    display: flex; gap: 4px; flex: 1; overflow-x: auto;
+  }
+  .page-nav .page-chip {
+    background: var(--bg-elev3); border: 1px solid var(--border);
+    color: var(--fg-dim);
+    padding: 4px 10px; border-radius: 4px;
+    font-size: 11px; cursor: pointer; flex-shrink: 0;
+    font-family: ui-monospace, Consolas, monospace;
+    min-width: 30px; text-align: center;
+  }
+  .page-nav .page-chip:hover { color: var(--fg); }
+  .page-nav .page-chip.active {
+    background: var(--accent); color: #fff; border-color: var(--accent);
+  }
+  .page-nav .page-chip.done::after {
+    content: "✓"; color: var(--success); margin-left: 4px;
+  }
+  .page-nav .page-chip.active.done::after { color: #fff; }
+  .page-nav .page-chip.error::after {
+    content: "✗"; color: var(--danger); margin-left: 4px;
+  }
+  .page-nav .page-info {
+    color: var(--fg-dim); font-size: 11px;
+    font-family: ui-monospace, Consolas, monospace;
+    flex-shrink: 0;
+  }
+
+  .canvas-wrap {
+    position: relative;
+    background: #000;
+    overflow: hidden;
+  }
+  .canvas-wrap img { display: block; width: 100%; height: auto; }
+  .canvas-wrap canvas {
+    position: absolute; left: 0; top: 0;
+    width: 100%; height: 100%;
+    cursor: crosshair;
+  }
+
+  .regions {
+    padding: 16px 20px;
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 10px;
+    background: var(--bg-elev);
+  }
+  .region {
+    background: var(--bg-elev2);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--box-text);
+    border-radius: 6px;
+    padding: 10px 12px;
+    cursor: pointer;
+    transition: all 0.12s;
+  }
+  .region:hover { background: var(--bg-elev3); }
+  .region.copied { background: rgba(63, 185, 80, 0.15); border-color: var(--success); }
+  .region[data-label="image"] { border-left-color: var(--box-image); }
+  .region[data-label="table"] { border-left-color: var(--box-table); }
+  .region[data-label="formula"] { border-left-color: var(--box-table); }
+  .region[data-label="chart"] { border-left-color: var(--box-image); }
+  .region .r-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+  .region .r-label { font-size: 11px; font-family: ui-monospace, Consolas, monospace; color: var(--fg-dim); }
+  .region .r-score { font-size: 11px; color: var(--fg-dim); font-family: ui-monospace, Consolas, monospace; }
+  .region .r-text {
+    font-size: 13px; line-height: 1.5; color: var(--fg);
+    word-break: break-word;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .region .r-text:empty::before {
+    content: "(空)"; color: var(--fg-dim); font-style: italic;
+  }
+  .region .r-hint {
+    font-size: 10px; color: var(--fg-dim); margin-top: 6px;
+    font-family: ui-monospace, Consolas, monospace;
+  }
+
+  /* Page-slot 状态机: waiting / processing / done / error */
+  .page-slot[data-status="waiting"] .canvas-wrap {
+    opacity: 0.45;
+    filter: grayscale(0.85);
+  }
+  .page-slot[data-status="waiting"] .canvas-wrap::after {
+    content: "等待处理";
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.35);
+    color: #fff; font-size: 14px;
+    font-family: ui-monospace, Consolas, monospace;
+    pointer-events: none;
+  }
+  .page-slot[data-status="processing"] .canvas-wrap {
+    opacity: 0.6;
+  }
+  .page-slot[data-status="processing"] .canvas-wrap::after {
+    content: "处理中…";
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,0.45);
+    color: #fff; font-size: 13px;
+    font-family: ui-monospace, Consolas, monospace;
+    pointer-events: none;
+  }
+  .page-slot[data-status="processing"] .canvas-wrap::before {
+    content: "";
+    position: absolute; left: 50%; top: 50%;
+    width: 40px; height: 40px;
+    margin: -20px 0 0 -20px;
+    border: 3px solid rgba(255,255,255,0.25);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    z-index: 5;
+  }
+  .page-slot[data-status="done"] .canvas-wrap { opacity: 1; }
+  .page-slot[data-status="error"] .canvas-wrap { opacity: 0.4; }
+  .page-slot[data-status="error"] .canvas-wrap::after {
+    content: "失败";
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(248,81,73,0.25);
+    color: #fff; font-size: 16px; font-weight: 600;
+    pointer-events: none;
+  }
+  /* chip 状态 */
+  .page-nav .page-chip.waiting { color: var(--fg-dim); }
+  .page-nav .page-chip.processing::after {
+    content: "●"; color: var(--accent); margin-left: 4px;
+    animation: pulse 1s ease-in-out infinite;
+  }
+  .page-nav .page-chip.error::after {
+    content: "✗"; color: var(--danger); margin-left: 4px;
+  }
+
+  /* Toast */
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(20px);
+    background: var(--success); color: #fff;
+    padding: 8px 16px; border-radius: 6px;
+    font-size: 13px; font-weight: 500;
+    opacity: 0; pointer-events: none;
+    transition: all 0.2s;
+    z-index: 100;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast.err { background: var(--danger); }
+
+  .empty-state {
+    text-align: center; color: var(--fg-dim);
+    padding: 32px 16px; font-size: 13px;
+  }
+
+  /* Result switcher (sticky 顶部横条, 多结果卡片导航) */
+  .result-switcher {
+    position: sticky; top: 49px; z-index: 9;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 10px;
+    margin-bottom: 16px;
+    display: none;  /* 没结果时隐藏 */
+    align-items: center; gap: 8px;
+    box-shadow: var(--shadow);
+  }
+  .result-switcher.show { display: flex; }
+  .result-switcher .rs-label {
+    color: var(--fg-dim); font-size: 11px;
+    font-family: ui-monospace, Consolas, monospace;
+    flex-shrink: 0;
+  }
+  .result-switcher .rs-tabs {
+    display: flex; gap: 6px;
+    flex: 1; overflow-x: auto;
+    scrollbar-width: thin;
+  }
+  .result-switcher .rs-tab {
+    flex-shrink: 0;
+    background: var(--bg-elev2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    cursor: pointer;
+    display: flex; align-items: center; gap: 6px;
+    min-width: 64px; max-width: 180px;
+    transition: all 0.12s;
+  }
+  .result-switcher .rs-tab:hover {
+    background: var(--bg-elev3);
+    border-color: var(--accent);
+  }
+  .result-switcher .rs-tab.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  .result-switcher .rs-tab-thumb {
+    width: 24px; height: 24px;
+    border-radius: 3px;
+    object-fit: cover;
+    background: #000;
+    flex-shrink: 0;
+  }
+  .result-switcher .rs-tab-text {
+    display: flex; flex-direction: column; gap: 1px;
+    min-width: 0;
+  }
+  .result-switcher .rs-tab-num {
+    font-size: 10px; color: var(--fg-dim);
+    font-family: ui-monospace, Consolas, monospace;
+    line-height: 1;
+  }
+  .result-switcher .rs-tab.active .rs-tab-num { color: rgba(255,255,255,0.8); }
+  .result-switcher .rs-tab-name {
+    font-size: 11px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    max-width: 130px;
+  }
+  .result-switcher .rs-tab-status {
+    font-size: 9px; padding: 1px 5px; border-radius: 2px;
+    text-transform: uppercase; letter-spacing: 0.3px;
+    font-weight: 600;
+    flex-shrink: 0;
+  }
+  .result-switcher .rs-tab-status.processing { background: var(--accent); color: #fff; }
+  .result-switcher .rs-tab-status.done { background: var(--success); color: #fff; }
+  .result-switcher .rs-tab-status.error { background: var(--danger); color: #fff; }
+  .result-switcher .rs-btn {
+    background: var(--bg-elev3); color: var(--fg);
+    border: 1px solid var(--border);
+    padding: 4px 10px; border-radius: 4px;
+    font-size: 12px; cursor: pointer; flex-shrink: 0;
+  }
+  .result-switcher .rs-btn:hover { background: var(--accent); color: #fff; }
+  .result-switcher .rs-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .result-switcher .rs-info {
+    color: var(--fg-dim); font-size: 11px;
+    font-family: ui-monospace, Consolas, monospace;
+    flex-shrink: 0;
+  }
+
+  /* result-card 高亮（点击 rs-tab 滚动到该卡片时） */
+  .result-card.scroll-target {
+    animation: highlight 1.5s ease-out;
+  }
+  @keyframes highlight {
+    0% { box-shadow: 0 0 0 3px var(--accent); }
+    100% { box-shadow: var(--shadow); }
+  }
+
+  /* 检测框颜色 (与 region 卡片一致) */
+  .box-text { stroke: var(--box-text); }
+  .box-image { stroke: var(--box-image); }
+  .box-table, .box-formula, .box-chart { stroke: var(--box-table); }
+  .box-text.fill { fill: rgba(86, 211, 100, 0.18); }
+  .box-image.fill { fill: rgba(255, 166, 87, 0.18); }
+  .box-table.fill, .box-formula.fill, .box-chart.fill { fill: rgba(210, 168, 255, 0.18); }
+
+  @media (max-width: 640px) {
+    main { padding: 12px; }
+    .result-card .head { padding: 12px 14px; }
+    .regions { padding: 12px 14px; }
+    .result-card .timing .big { font-size: 20px; }
+    .page-nav { padding: 8px 12px; }
+  }
+</style>
+<!-- PDF.js (legacy UMD build for inline <script> use) -->
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.min.js"></script>
+</head>
+<body>
+<header>
+  <h1><span class="logo"></span> Wise-Paddle · OCR Playground</h1>
+  <div class="stats">
+    <span>pool <b id="stat-pool">–</b></span>
+    <span>pending <b id="stat-pending">–</b></span>
+    <span>batch <b id="stat-batch">–</b></span>
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <label class="drop-zone" id="drop-zone">
+      <input type="file" id="file-input" accept="image/*,application/pdf" multiple />
+      <div>把图片 / PDF 拖到这里，或者 <strong>点我选择</strong></div>
+      <div class="hint">支持 PNG / JPG / WebP / PDF</div>
+    </label>
+
+    <div class="queue-section" id="queue-section" style="display:none;">
+      <h2>队列 <span class="count" id="queue-count">0</span></h2>
+      <div class="queue" id="queue"></div>
+      <div class="actions">
+        <button class="btn" id="start-btn" disabled>开始处理</button>
+        <button class="btn ghost" id="clear-queue-btn">清空队列</button>
+        <span style="font-size:12px;color:var(--fg-dim);margin-left:auto;" id="queue-status"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="result-switcher" id="result-switcher">
+    <span class="rs-label">结果</span>
+    <button class="rs-btn" id="rs-prev" disabled>‹</button>
+    <div class="rs-tabs" id="rs-tabs"></div>
+    <button class="rs-btn" id="rs-next" disabled>›</button>
+    <span class="rs-info" id="rs-info">0 / 0</span>
+  </div>
+
+  <div id="result-list"></div>
+  <div id="empty" class="empty-state">还没有结果。先在左边加文件，点"开始处理"。</div>
+</main>
+
+<div style="display:flex;justify-content:flex-end;padding:0 20px 16px;max-width:1100px;margin:0 auto;">
+  <button class="btn ghost" id="clear-results-btn" style="display:none;">清空结果</button>
+</div>
+
+<div class="toast" id="toast">已复制</div>
+
+<script>
+"use strict";
+
+// ===== PDF.js setup =====
+if (window.pdfjsLib) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.worker.min.js";
+}
+
+const $ = (sel) => document.querySelector(sel);
+const resultList = $("#result-list");
+const empty = $("#empty");
+const toast = $("#toast");
+const queueSection = $("#queue-section");
+const queueEl = $("#queue");
+const queueCountEl = $("#queue-count");
+const startBtn = $("#start-btn");
+const clearQueueBtn = $("#clear-queue-btn");
+const clearResultsBtn = $("#clear-results-btn");
+const queueStatus = $("#queue-status");
+const fileInput = $("#file-input");
+const rs = $("#result-switcher");
+const rsTabs = $("#rs-tabs");
+const rsPrev = $("#rs-prev");
+const rsNext = $("#rs-next");
+const rsInfo = $("#rs-info");
+let resultSeq = 0;
+// user_id → request_id 映射; 每个 queue item 一个 user_id
+// 当前还在处理的 user_id 集合（处理完移除；pagehide 时 sendBeacon 一次性 release）
+// 当前还在处理的 user_id 集合（用于 pagehide 时 sendBeacon 一次性释放）
+// 注意：服务端不再依赖心跳；只在 pagehide/beforeunload/visibilitychange→hidden 时释放
+const activeUserIds = new Set();
+
+// ===== 队列状态 =====
+/**
+ * @typedef {Object} QueueItem
+ * @property {string} id
+ * @property {File} file
+ * @property {boolean} isPdf
+ * @property {string|null} fileUrl        - 单图的 ObjectURL
+ * @property {number} pageCount          - 1 = 单图, N = PDF 页数
+ * @property {string} status             - pending | processing | done | error
+ * @property {Array<{b64:string,w:number,h:number}>} previewPages  - PDF 抽帧占位
+ */
+
+/** @type {QueueItem[]} */
+const queue = [];
+
+function uid() { return Math.random().toString(36).slice(2, 10); }
+
+function showToast(msg, isErr = false) {
+  toast.textContent = msg;
+  toast.classList.toggle("err", isErr);
+  toast.classList.add("show");
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => toast.classList.remove("show"), 1500);
+}
+
+async function copyText(text, silent = false) {
+  if (!text) {
+    if (!silent) showToast("该区域无文字", true);
+    return false;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand("copy"); ta.remove();
+  }
+  if (!silent) showToast(`已复制 ${text.length} 字符`);
+  return true;
+}
+
+// ===== Health polling =====
+async function pollHealth() {
+  try {
+    const r = await fetch("/health");
+    const d = await r.json();
+    $("#stat-pool").textContent = `${d.pool_free}/${d.pool_size}`;
+    $("#stat-pending").textContent = d.scheduler_pending;
+    $("#stat-batch").textContent = d.batch_max;
+  } catch (e) { /* ignore */ }
+}
+setInterval(pollHealth, 1500);
+pollHealth();
+
+// ===== PDF 占位抽帧（不占 GPU，几百 ms） =====
+async function renderPdfPages(pdfFile, maxW = 1000) {
+  if (!window.pdfjsLib) throw new Error("PDF.js 未加载");
+  const buf = await pdfFile.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  const out = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const baseViewport = page.getViewport({ scale: 1 });
+    const scale = Math.min(2, maxW / baseViewport.width);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.floor(viewport.width);
+    canvas.height = Math.floor(viewport.height);
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+    out.push({ b64: canvas.toDataURL("image/png"), w: canvas.width, h: canvas.height });
+  }
+  return out;
+}
+
+// ===== Drop zone =====
+const dz = $("#drop-zone");
+dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("drag-over"); });
+dz.addEventListener("dragleave", () => dz.classList.remove("drag-over"));
+dz.addEventListener("drop", (e) => {
+  e.preventDefault(); dz.classList.remove("drag-over");
+  handleFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener("change", (e) => handleFiles(e.target.files));
+
+async function handleFiles(fileList) {
+  for (const f of fileList) {
+    const isPdf = f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
+    const item = {
+      id: uid(),
+      file: f,
+      isPdf,
+      fileUrl: isPdf ? null : URL.createObjectURL(f),
+      pageCount: 1,
+      status: "pending",
+      previewPages: [],
+    };
+    queue.push(item);
+    renderQueue();
+    if (isPdf) {
+      try {
+        item.previewPages = await renderPdfPages(f);
+        item.pageCount = item.previewPages.length;
+        renderQueue();
+      } catch (e) {
+        console.error("PDF preview failed", e);
+        showToast("PDF 预览失败：" + e.message, true);
+        item.status = "error";
+        renderQueue();
+      }
+    }
+  }
+  fileInput.value = "";
+}
+
+function renderQueue() {
+  const pending = queue.filter(q => q.status === "pending").length;
+  const processing = queue.filter(q => q.status === "processing").length;
+  queueCountEl.textContent = String(queue.length);
+  if (queue.length === 0) {
+    queueSection.style.display = "none";
+    return;
+  }
+  queueSection.style.display = "";
+  startBtn.disabled = pending === 0;
+
+  queueEl.innerHTML = queue.map(q => {
+    let thumb;
+    let extraTag = "";
+    if (q.isPdf) {
+      const firstPage = q.previewPages[0];
+      const src = firstPage ? firstPage.b64 : "";
+      const pagesTag = q.pageCount > 1 ? `<span class="pages-tag">${q.pageCount} 页</span>` : "";
+      extraTag = pagesTag;
+      thumb = src
+        ? `<img src="${src}" alt="pdf" />`
+        : `<div style="display:flex;align-items:center;justify-content:center;height:100%;font-size:32px;color:var(--warn);">PDF</div>`;
+    } else {
+      thumb = `<img src="${q.fileUrl}" alt="" />`;
+    }
+    const statusLabel = { pending: "待处理", processing: "处理中", done: "完成", error: "失败" }[q.status];
+    return `
+      <div class="queue-item ${q.status}" data-id="${q.id}">
+        ${thumb}
+        ${extraTag}
+        <span class="badge ${q.status}">${statusLabel}</span>
+        <button class="remove" data-id="${q.id}" title="移除">×</button>
+        <div class="file-name">${escapeHtml(q.file.name)}</div>
+      </div>`;
+  }).join("");
+
+  queueStatus.textContent = processing > 0
+    ? `处理中 ${processing} 个文件，剩 ${pending} 个待处理`
+    : (pending > 0 ? `${pending} 个待处理` : (queue.length > 0 ? `全部 ${queue.length} 个已完成` : ""));
+
+  queueEl.querySelectorAll(".remove").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const id = btn.dataset.id;
+      const idx = queue.findIndex(q => q.id === id);
+      if (idx >= 0) {
+        if (queue[idx].fileUrl) URL.revokeObjectURL(queue[idx].fileUrl);
+        queue.splice(idx, 1);
+        renderQueue();
+      }
+    });
+  });
+}
+
+clearQueueBtn.addEventListener("click", () => {
+  queue.forEach(q => { if (q.fileUrl) URL.revokeObjectURL(q.fileUrl); });
+  queue.length = 0;
+  renderQueue();
+});
+
+// ===== 开始处理 =====
+startBtn.addEventListener("click", async () => {
+  const items = queue.filter(q => q.status === "pending" && (!q.isPdf || q.pageCount > 0));
+  if (items.length === 0) return;
+  items.forEach(q => q.status = "processing");
+  renderQueue();
+  await Promise.all(items.map(q => processOne(q)));
+});
+
+async function processOne(item) {
+  const t0 = performance.now();
+  // 1) 立即建一个"处理中"placeholder card
+  const ctl = buildPlaceholderCard(item);
+  // 2) 申请一个 client-side user_id, 通过 query string 传给服务端
+  //    (服务端用这个 user_id 做 scheduler key + release 标识)
+  const clientUserId = `web-${uid()}`;
+  activeUserIds.add(clientUserId);
+  try {
+    const fd = new FormData();
+    fd.append("file", item.file);
+    const url = item.isPdf ? "/ocr/pdf" : "/ocr/upload";
+    const r = await fetch(`${url}?user_id=${encodeURIComponent(clientUserId)}`,
+      { method: "POST", body: fd, signal: AbortSignal.timeout(900_000) });
+    const wallMs = performance.now() - t0;
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      item.status = "error";
+      renderQueue();
+      markCardError(ctl, err.detail || `HTTP ${r.status}`, wallMs);
+      // 失败时也要释放 user_id（不会再有结果）
+      activeUserIds.delete(clientUserId);
+      try {
+        const blob = new Blob([JSON.stringify({ user_id: clientUserId })], { type: "application/json" });
+        navigator.sendBeacon("/api/release", blob);
+      } catch (e) {}
+      return;
+    }
+    const data = await r.json();
+    // 队列状态切到 processing
+    item.status = "processing";
+    renderQueue();
+    // 区分 PDF 异步流式 vs 单图同步
+    if (item.isPdf && data.total_pages && data.poll_url) {
+      // PDF: 后台跑批, 走轮询路径
+      pollPdfProgress(ctl, item, clientUserId, data, t0);
+    } else {
+      // 单图 / base64: 同步响应, 立即填充
+      const wallMs = performance.now() - t0;
+      item.status = "done";
+      renderQueue();
+      activeUserIds.delete(clientUserId);
+      fillCardWithResult(ctl, item, data, wallMs);
+    }
+  } catch (e) {
+    item.status = "error";
+    renderQueue();
+    markCardError(ctl, String(e), performance.now() - t0);
+    activeUserIds.delete(clientUserId);
+    try {
+      const blob = new Blob([JSON.stringify({ user_id: clientUserId })], { type: "application/json" });
+      navigator.sendBeacon("/api/release", blob);
+    } catch (e) {}
+  }
+}
+
+/**
+ * PDF 流式轮询: 每 1.5s 拉一次 /api/ocr/pdf-status/{user_id},
+ * 每收到新 page 立即更新对应 page-slot (而不是等所有 page 跑完).
+ * 全部 done 后停止轮询.
+ */
+async function pollPdfProgress(ctl, item, userId, initData, t0) {
+  const totalPages = initData.total_pages;
+  const pollUrl = initData.poll_url;
+  const filledPages = new Set();
+
+  // head 更新
+  const rid = ctl.head.querySelector('[data-role="rid"]');
+  if (rid) rid.textContent = (userId || "").replace(/^web-/, "");
+  const pageinfo = ctl.head.querySelector('[data-role="pageinfo"]');
+  if (pageinfo) pageinfo.textContent = `0 / ${totalPages} 页 · 处理中…`;
+  const status = ctl.head.querySelector('[data-role="status"]');
+  if (status) status.textContent = "处理中";
+
+  const tick = async () => {
+    try {
+      const r = await fetch(pollUrl, { cache: "no-store" });
+      if (!r.ok) { setTimeout(tick, 1500); return; }
+      const data = await r.json();
+
+      // 处理每个新 page (后端返回所有已完成页，前端用 filledPages 去重)
+      const pageIds = Object.keys(data.pages || {}).map(Number).sort((a, b) => a - b);
+      for (const pidx of pageIds) {
+        if (filledPages.has(pidx)) continue;
+        const pageData = data.pages[pidx];
+        fillOnePageSlot(ctl, item, pidx, pageData);
+        filledPages.add(pidx);
+        // 切对应 page-slot 状态为 done, chip 状态为 done
+        if (ctl.pageSlots[pidx]) ctl.pageSlots[pidx].dataset.status = "done";
+        if (ctl.chips) {
+          const chip = ctl.chips.querySelector(`.page-chip[data-page-index="${pidx}"]`);
+          if (chip) { chip.classList.remove("processing"); chip.classList.add("done"); }
+        }
+      }
+
+      // 更新 head 计数
+      const doneCount = data.done_count || filledPages.size;
+      const phaseLabel = data.cancelled ? "已取消" : (data.done ? "完成" : "处理中");
+      if (pageinfo) pageinfo.textContent = `${doneCount} / ${totalPages} 页 · ${data.done ? "完成" : "处理中…"}`;
+      if (status) status.textContent = `${phaseLabel} ${doneCount}/${totalPages}`;
+
+      if (data.done || data.cancelled || data.error) {
+        const wallMs = performance.now() - t0;
+        item.status = (data.cancelled || data.error) ? "error" : "done";
+        renderQueue();
+        activeUserIds.delete(userId);
+        if (data.error) {
+          markCardError(ctl, data.error, wallMs);
+        } else if (data.cancelled) {
+          markCardError(ctl, "客户端取消 / 心跳超时", wallMs);
+        }
+        // 切所有未完成 page-slot 状态
+        for (let i = 0; i < ctl.totalPages; i++) {
+          if (!filledPages.has(i)) {
+            if (ctl.pageSlots[i]) {
+              ctl.pageSlots[i].dataset.status = (data.cancelled || data.error) ? "error" : "waiting";
+            }
+            if (ctl.chips) {
+              const chip = ctl.chips.querySelector(`.page-chip[data-page-index="${i}"]`);
+              if (chip) {
+                chip.classList.remove("processing");
+                if (data.cancelled || data.error) chip.classList.add("error");
+              }
+            }
+          }
+        }
+        // timing 更新
+        const big = ctl.head.querySelector('[data-role="server"]');
+        if (big) {
+          big.classList.remove("processing");
+          if (data.cancelled || data.error) {
+            big.classList.add("error");
+            big.textContent = data.cancelled ? "取消" : "失败";
+          } else {
+            big.innerHTML = `${(wallMs / 1000).toFixed(2)}<span style="font-size:14px;color:var(--fg-dim);">s</span>`;
+          }
+        }
+        const wallEl = ctl.head.querySelector('[data-role="wall"]');
+        if (wallEl) wallEl.textContent = `${(wallMs / 1000).toFixed(2)}s`;
+        return;  // 停止轮询
+      }
+      setTimeout(tick, 1500);
+    } catch (e) {
+      setTimeout(tick, 2500);  // 网络错误慢点重试
+    }
+  };
+  tick();
+}
+
+/**
+ * 单 page 增量更新: 把一个已完成 page 的 OCR 结果填到对应 page-slot
+ */
+function fillOnePageSlot(ctl, item, pageIndex, pageData) {
+  const isPdf = item.isPdf;
+  const slot = ctl.pageSlots[pageIndex];
+  if (!slot) return;
+  // 替换 image src 为 server 返回的图 (替换原 PDF preview)
+  const finalSrc = pageData.image_b64
+    ? `data:image/png;base64,${pageData.image_b64}`
+    : (isPdf && item.previewPages[pageIndex] ? item.previewPages[pageIndex].b64 : (item.fileUrl || ""));
+  const finalW = pageData.width || (item.previewPages[pageIndex] && item.previewPages[pageIndex].w) || 0;
+  const finalH = pageData.height || (item.previewPages[pageIndex] && item.previewPages[pageIndex].h) || 0;
+  const wrap = slot.querySelector('[data-role="wrap"]');
+  if (wrap) {
+    wrap.dataset.imgB64 = finalSrc;
+    wrap.dataset.w = String(finalW);
+    wrap.dataset.h = String(finalH);
+    wrap.dataset.status = "done";
+    const oldImg = wrap.querySelector("img");
+    if (finalSrc) {
+      if (oldImg) oldImg.src = finalSrc;
+      else {
+        const img = document.createElement("img");
+        img.src = finalSrc;
+        const cv = wrap.querySelector("canvas");
+        if (cv) wrap.insertBefore(img, cv);
+        else wrap.appendChild(img);
+      }
+    }
+  }
+  // 填 region 卡片
+  const regionsEl = slot.querySelector(`[data-role="regions-${pageIndex}"]`);
+  const pageRegions = pageData.regions || [];
+  if (regionsEl) {
+    if (pageRegions.length === 0) {
+      regionsEl.innerHTML = `<div class="empty-state" style="grid-column:1/-1;padding:12px;">未检测到任何区域</div>`;
+    } else {
+      regionsEl.innerHTML = pageRegions.map((r, j) => `
+        <div class="region" data-idx="${j}" data-page="${pageIndex}" data-label="${escapeHtml(r.label)}"
+             data-rect="${r.rect.join(",")}" data-score="${r.score}">
+          <div class="r-head">
+            <span class="r-label">${escapeHtml(r.label)}</span>
+            <span class="r-score">${(r.score * 100).toFixed(1)}% · #${j}</span>
+          </div>
+          <div class="r-text">${escapeHtml(r.markdown || "")}</div>
+          <div class="r-hint">悬停框即复制</div>
+        </div>`).join("");
+    }
+  }
+  // wire canvas 检测框 + hover-copy
+  if (typeof wirePageCanvas === "function") wirePageCanvas(ctl, pageIndex);
+  ctl.card.dataset.status = "done";
+  // 更新 tab 状态
+  if (typeof updateResultTab === "function") updateResultTab(ctl.seq, "done");
+}
+
+// ===== Result card 构造 =====
+
+/**
+ * 立即建一个"处理中"占位卡：head 显示文件名 + "提交中"，所有 page-slot 状态=processing。
+ * 返回 controller 供 fillCardWithResult / markCardError 后续操作。
+ */
+function buildPlaceholderCard(item) {
+  empty.style.display = "none";
+  const seq = ++resultSeq;
+  const card = document.createElement("div");
+  card.className = "result-card";
+  card.dataset.seq = seq;
+  card.dataset.kind = item.isPdf ? "pdf" : "image";
+  card.dataset.startedAt = String(performance.now());
+
+  // head
+  const head = document.createElement("div");
+  head.className = "head";
+  head.innerHTML = `
+    <div class="title">
+      ${item.isPdf ? "📄" : "🖼"} <strong>${escapeHtml(item.file.name)}</strong>
+      <span class="rid">request_id <b data-role="rid">—</b> · <span data-role="pageinfo">${item.isPdf ? `${item.pageCount} 页` : "1 页"}</span> · <span data-role="status">提交中…</span></span>
+    </div>
+    <div class="timing">
+      <div class="big processing" data-role="server">—</div>
+      <div class="small">wall <b data-role="wall">0.00s</b><br>queue <b data-role="queue">0.00s</b></div>
+    </div>
+  `;
+  card.appendChild(head);
+
+  const totalPages = item.isPdf ? Math.max(item.pageCount, 1) : 1;
+  const isPdf = item.isPdf;
+
+  // 页面导航（多页才有）
+  let nav = null;
+  let chips = null;
+  let info = null;
+  if (totalPages > 1) {
+    nav = document.createElement("div");
+    nav.className = "page-nav";
+    nav.innerHTML = `
+      <button class="nav-btn" data-role="prev" disabled>‹</button>
+      <div class="page-chips" data-role="chips"></div>
+      <button class="nav-btn" data-role="next" disabled>›</button>
+      <span class="page-info" data-role="info">1 / ${totalPages}</span>
+    `;
+    chips = nav.querySelector('[data-role="chips"]');
+    info = nav.querySelector('[data-role="info"]');
+    for (let i = 0; i < totalPages; i++) {
+      const chip = document.createElement("button");
+      chip.className = "page-chip processing";
+      chip.textContent = `${i + 1}`;
+      chip.dataset.pageIndex = i;
+      chip.addEventListener("click", () => showPage(i));
+      chips.appendChild(chip);
+    }
+    card.appendChild(nav);
+  }
+
+  // page slots
+  const pageSlots = [];
+  for (let i = 0; i < totalPages; i++) {
+    const slot = document.createElement("div");
+    slot.className = "page-slot";
+    slot.dataset.pageIndex = i;
+    slot.dataset.status = "processing";  // 一开始就是 processing
+    slot.style.display = (i === 0) ? "" : "none";
+
+    const preview = isPdf ? item.previewPages[i] : null;
+    const initialB64 = preview ? preview.b64 : (item.fileUrl || null);
+    const initialW = preview ? preview.w : 0;
+    const initialH = preview ? preview.h : 0;
+    const initialSrc = initialB64 || "";
+
+    if (initialSrc) {
+      slot.innerHTML = `
+        <div class="canvas-wrap" data-role="wrap" data-img-b64="${escapeAttr(initialSrc)}" data-w="${initialW}" data-h="${initialH}" data-status="processing">
+          <img src="${escapeAttr(initialSrc)}" alt="page ${i+1}" />
+          <canvas></canvas>
+        </div>
+        <div class="regions" data-role="regions-${i}"></div>
+      `;
+    } else {
+      slot.innerHTML = `
+        <div class="canvas-wrap" data-role="wrap" data-status="processing">
+          <div style="aspect-ratio:1;display:flex;align-items:center;justify-content:center;color:var(--fg-dim);background:#000;">处理中…</div>
+          <canvas></canvas>
+        </div>
+        <div class="regions" data-role="regions-${i}"></div>
+      `;
+    }
+    card.appendChild(slot);
+    pageSlots.push(slot);
+  }
+
+  // 存储每页的 canvas 重绘函数（issue#2: 页面切换时触发重绘）
+  const _pageRedraws = {};
+  resultList.prepend(card);
+  updateClearResultsBtn();
+
+  // 在 result-switcher 注册该 card
+  addResultTab(seq, item);
+
+  const showPage = (idx) => {
+    idx = Math.max(0, Math.min(totalPages - 1, idx));
+    pageSlots.forEach((s, i) => { s.style.display = (i === idx) ? "" : "none"; });
+    if (chips) {
+      chips.querySelectorAll(".page-chip").forEach((c, i) => c.classList.toggle("active", i === idx));
+      if (info) info.textContent = `${idx + 1} / ${totalPages}`;
+    }
+    // 页面切换后触发 canvas 重绘（修复隐藏页 canvas 尺寸为 0 的问题）
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (_pageRedraws[idx]) _pageRedraws[idx]();
+      });
+    });
+  };
+  // 默认显示 page 0
+  if (chips) {
+    const c0 = chips.querySelector('.page-chip[data-page-index="0"]');
+    if (c0) c0.classList.add("active");
+  }
+
+  return { card, head, nav, chips, info, pageSlots, totalPages, showPage, seq, _pageRedraws };
+}
+
+/**
+ * 拿到 server 数据后，把占位卡升级为 done 状态：填 region、wire canvas、更新 timing
+ */
+function fillCardWithResult(ctl, item, data, wallMs) {
+  const isPdf = item.isPdf;
+  const totalPages = (data.pages || []).length;
+  const regions = data.regions || [];
+  ctl.card.dataset.status = "done";
+  updateResultTab(ctl.seq, "done");
+
+  // 1) head 更新
+  const rid = ctl.head.querySelector('[data-role="rid"]');
+  if (rid) rid.textContent = data.request_id || "—";
+  const pageinfo = ctl.head.querySelector('[data-role="pageinfo"]');
+  if (pageinfo) pageinfo.textContent = `${totalPages} 页 · ${regions.length} regions`;
+  const status = ctl.head.querySelector('[data-role="status"]');
+  if (status) status.textContent = "完成";
+  const big = ctl.head.querySelector('[data-role="server"]');
+  if (big) {
+    big.classList.remove("processing");
+    big.classList.remove("error");
+    const s = Number(data.elapsed_seconds) || 0;
+    big.innerHTML = `${s.toFixed(2)}<span style="font-size:14px;color:var(--fg-dim);">s</span>`;
+  }
+  const wallEl = ctl.head.querySelector('[data-role="wall"]');
+  if (wallEl) wallEl.textContent = `${(wallMs / 1000).toFixed(2)}s`;
+  const queueEl = ctl.head.querySelector('[data-role="queue"]');
+  if (queueEl) queueEl.textContent = `${(Number(data.queue_wait_seconds) || 0).toFixed(2)}s`;
+
+  // 2) 启用 nav 按钮
+  if (ctl.nav) {
+    ctl.nav.querySelector('[data-role="prev"]').addEventListener("click", () => {
+      const active = Array.from(ctl.chips.querySelectorAll(".page-chip")).findIndex(c => c.classList.contains("active"));
+      if (active > 0) ctl.showPage(active - 1);
+    });
+    ctl.nav.querySelector('[data-role="next"]').addEventListener("click", () => {
+      const active = Array.from(ctl.chips.querySelectorAll(".page-chip")).findIndex(c => c.classList.contains("active"));
+      if (active < ctl.totalPages - 1) ctl.showPage(active + 1);
+    });
+  }
+
+  // 3) 每个 page-slot 切到 done 状态
+  const safeN = Math.min(ctl.totalPages, ctl.pageSlots.length);
+  for (let i = 0; i < safeN; i++) {
+    const slot = ctl.pageSlots[i];
+    if (!slot) continue;
+    slot.dataset.status = "done";
+    const p = (data.pages && i < data.pages.length) ? data.pages[i] : null;
+    const preview = isPdf ? (item.previewPages || [])[i] : null;
+    const finalSrc = (p && p.image_b64) ? `data:image/png;base64,${p.image_b64}` : (preview ? preview.b64 : (item.fileUrl || ""));
+    const finalW = (p && p.width) || (preview && preview.w) || 0;
+    const finalH = (p && p.height) || (preview && preview.h) || 0;
+    const wrap = slot.querySelector('[data-role="wrap"]');
+    if (wrap) {
+      wrap.dataset.imgB64 = finalSrc;
+      wrap.dataset.w = String(finalW);
+      wrap.dataset.h = String(finalH);
+      wrap.dataset.status = "done";
+      const oldImg = wrap.querySelector("img");
+      if (finalSrc) {
+        if (oldImg) {
+          oldImg.src = finalSrc;
+        } else {
+          const img = document.createElement("img");
+          img.src = finalSrc;
+          const canvasEl = wrap.querySelector("canvas");
+          if (canvasEl) wrap.insertBefore(img, canvasEl);
+          else wrap.appendChild(img);
+        }
+      } else {
+        const ph = wrap.querySelector("div");
+        if (ph) ph.remove();
+      }
+    }
+    // chip 状态
+    if (ctl.chips) {
+      const chip = ctl.chips.querySelector(`.page-chip[data-page-index="${i}"]`);
+      if (chip) {
+        chip.classList.remove("processing");
+        chip.classList.add("done");
+      }
+    }
+    // regions
+    const pageRegions = regions.filter(r => r.page_index === i);
+    const regionsEl = slot.querySelector(`[data-role="regions-${i}"]`);
+    if (regionsEl) {
+      if (pageRegions.length === 0) {
+        regionsEl.innerHTML = `<div class="empty-state" style="grid-column:1/-1;padding:12px;">未检测到任何区域</div>`;
+      } else {
+        regionsEl.innerHTML = pageRegions.map((r, j) => `
+          <div class="region" data-idx="${j}" data-page="${i}" data-label="${escapeHtml(r.label)}"
+               data-rect="${r.rect.join(",")}" data-score="${r.score}">
+            <div class="r-head">
+              <span class="r-label">${escapeHtml(r.label)}</span>
+              <span class="r-score">${(r.score * 100).toFixed(1)}% · #${j}</span>
+            </div>
+            <div class="r-text">${escapeHtml(r.markdown || "")}</div>
+            <div class="r-hint">悬停框即复制</div>
+          </div>`).join("");
+      }
+    }
+    // wire canvas 检测框 + hover-copy
+    wirePageCanvas(ctl, i);
+  }
+  // 如果 slot 比实际资料多，剩下的也标 done（带预览图）
+  for (let i = safeN; i < ctl.totalPages; i++) {
+    const slot = ctl.pageSlots[i];
+    if (slot) slot.dataset.status = "done";
+  }
+}
+
+function wirePageCanvas(ctl, pageIdx) {
+  const slot = ctl.pageSlots[pageIdx];
+  const wrap = slot.querySelector('[data-role="wrap"]');
+  if (!wrap) return;
+  const img = wrap.querySelector("img");
+  const canvas = wrap.querySelector("canvas");
+  const regionEls = Array.from(slot.querySelectorAll(".region"));
+  if (regionEls.length === 0) return;
+
+  const regionData = regionEls.map(el => ({
+    label: el.dataset.label,
+    score: parseFloat(el.dataset.score),
+    rect: el.dataset.rect.split(",").map(Number),
+    el,
+  }));
+
+  const setup = () => {
+    const dpr = window.devicePixelRatio || 1;
+    const r = wrap.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return; // 隐藏页跳过（等 showPage 触发重绘）
+    canvas.width = Math.round(r.width * dpr);
+    canvas.height = Math.round(r.height * dpr);
+    canvas.style.width = r.width + "px";
+    canvas.style.height = r.height + "px";
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawBoxes(ctx, regionData, parseInt(wrap.dataset.w), parseInt(wrap.dataset.h), r.width, r.height, -1);
+  };
+
+  // 存储重绘函数供 showPage 切换页面时调用（修复隐藏页 canvas 尺寸为 0 的问题）
+  if (ctl._pageRedraws) ctl._pageRedraws[pageIdx] = setup;
+
+  if (img && img.complete && img.naturalWidth > 0) {
+    setup();
+  } else if (img) {
+    img.addEventListener("load", setup);
+  }
+  requestAnimationFrame(() => requestAnimationFrame(setup));
+  if (!ctl.card._resizeBound) {
+    window.addEventListener("resize", () => {
+      // 窗口缩放时重绘所有已注册的页（仅当前可见页会实际绘制）
+      Object.values(ctl._pageRedraws).forEach(fn => fn());
+    });
+    ctl.card._resizeBound = true;
+  }
+
+  let lastHoverIdx = -1;
+  canvas.addEventListener("mousemove", (e) => {
+    if (wrap.dataset.status !== "done") return;
+    const idx = hitTestBox(e, canvas, regionData, parseInt(wrap.dataset.w), parseInt(wrap.dataset.h));
+    if (idx !== lastHoverIdx) {
+      lastHoverIdx = idx;
+      const r = wrap.getBoundingClientRect();
+      const ctx = canvas.getContext("2d");
+      drawBoxes(ctx, regionData, parseInt(wrap.dataset.w), parseInt(wrap.dataset.h), r.width, r.height, idx);
+      canvas.style.cursor = idx >= 0 ? "pointer" : "crosshair";
+    }
+  });
+  canvas.addEventListener("mouseleave", () => {
+    if (lastHoverIdx >= 0) {
+      lastHoverIdx = -1;
+      const r = wrap.getBoundingClientRect();
+      const ctx = canvas.getContext("2d");
+      drawBoxes(ctx, regionData, parseInt(wrap.dataset.w), parseInt(wrap.dataset.h), r.width, r.height, -1);
+      canvas.style.cursor = "crosshair";
+    }
+  });
+  canvas.addEventListener("click", (e) => {
+    if (wrap.dataset.status !== "done") return;
+    const idx = hitTestBox(e, canvas, regionData, parseInt(wrap.dataset.w), parseInt(wrap.dataset.h));
+    if (idx >= 0) {
+      const text = regionData[idx].el.querySelector(".r-text").textContent;
+      copyText(text);
+      regionData[idx].el.classList.add("copied");
+      setTimeout(() => regionData[idx].el.classList.remove("copied"), 700);
+    }
+  });
+
+  regionEls.forEach((el) => {
+    el.addEventListener("click", () => {
+      const text = el.querySelector(".r-text").textContent;
+      copyText(text);
+      el.classList.add("copied");
+      setTimeout(() => el.classList.remove("copied"), 700);
+    });
+  });
+}
+
+function markCardError(ctl, msg, wallMs) {
+  ctl.card.dataset.status = "error";
+  updateResultTab(ctl.seq, "error");
+  // head: 标红
+  const status = ctl.head.querySelector('[data-role="status"]');
+  if (status) status.textContent = "失败";
+  const big = ctl.head.querySelector('[data-role="server"]');
+  if (big) {
+    big.classList.remove("processing");
+    big.classList.add("error");
+    big.textContent = "失败";
+  }
+  const wallEl = ctl.head.querySelector('[data-role="wall"]');
+  if (wallEl) wallEl.textContent = `${(wallMs / 1000).toFixed(2)}s`;
+  // 所有 page-slot 标 error
+  ctl.pageSlots.forEach((slot, i) => {
+    slot.dataset.status = "error";
+    if (ctl.chips) {
+      const chip = ctl.chips.querySelector(`.page-chip[data-page-index="${i}"]`);
+      if (chip) {
+        chip.classList.remove("processing");
+        chip.classList.add("error");
+      }
+    }
+  });
+  // 在 card 内加错误条
+  const errBar = document.createElement("div");
+  errBar.className = "pdf-placeholder";
+  errBar.style.borderLeftColor = "var(--danger)";
+  errBar.style.margin = "16px 20px";
+  errBar.innerHTML = `
+    <div class="pulse" style="background:var(--danger);"></div>
+    <div>${escapeHtml(msg)}</div>
+  `;
+  ctl.card.appendChild(errBar);
+}
+
+function hitTestBox(e, canvas, regionData, srcW, srcH) {
+  const r = canvas.getBoundingClientRect();
+  const sx = r.width / srcW, sy = r.height / srcH;
+  const cx = (e.clientX - r.left);
+  const cy = (e.clientY - r.top);
+  for (let i = regionData.length - 1; i >= 0; i--) {
+    const [x1, y1, x2, y2] = regionData[i].rect;
+    if (cx >= x1 * sx && cx <= x2 * sx && cy >= y1 * sy && cy <= y2 * sy) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function drawBoxes(ctx, regions, srcW, srcH, dstW, dstH, highlightIdx) {
+  ctx.clearRect(0, 0, dstW, dstH);
+  const sx = dstW / srcW, sy = dstH / srcH;
+  const root = getComputedStyle(document.documentElement);
+  const colorMap = {
+    text: root.getPropertyValue("--box-text").trim(),
+    image: root.getPropertyValue("--box-image").trim(),
+    table: root.getPropertyValue("--box-table").trim(),
+    formula: root.getPropertyValue("--box-table").trim(),
+    chart: root.getPropertyValue("--box-image").trim(),
+  };
+  regions.forEach((r, i) => {
+    const [x1, y1, x2, y2] = r.rect;
+    const isHi = (i === highlightIdx);
+    ctx.lineWidth = isHi ? 3 : 1.5;
+    ctx.strokeStyle = colorMap[r.label] || colorMap.text;
+    if (isHi) {
+      ctx.fillStyle = colorMap[r.label] || colorMap.text;
+      ctx.globalAlpha = 0.18;
+    } else {
+      ctx.fillStyle = "transparent";
+      ctx.globalAlpha = 1;
+    }
+    const w = (x2 - x1) * sx, h = (y2 - y1) * sy;
+    ctx.fillRect(x1 * sx, y1 * sy, w, h);
+    ctx.globalAlpha = 1;
+    ctx.strokeRect(x1 * sx, y1 * sy, w, h);
+    if (isHi) {
+      ctx.font = '600 12px ui-monospace, Consolas, monospace';
+      const txt = `${r.label} · #${i} · ${Math.round(r.score * 100)}%`;
+      const tw = ctx.measureText(txt).width;
+      const tagH = 18, padX = 6;
+      let ty = y1 * sy - tagH - 2;
+      if (ty < 0) ty = y1 * sy + 2;
+      ctx.fillStyle = colorMap[r.label] || colorMap.text;
+      ctx.fillRect(x1 * sx, ty, tw + padX * 2, tagH);
+      ctx.fillStyle = "#0e1116";
+      ctx.fillText(txt, x1 * sx + padX, ty + 13);
+    }
+  });
+}
+
+function escapeHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function escapeAttr(s) {
+  return String(s ?? "").replace(/"/g, "&quot;");
+}
+
+// ===== 多结果导航 (result-switcher) =====
+function addResultTab(seq, item) {
+  const tab = document.createElement("div");
+  tab.className = "rs-tab active";  // 最新添加的默认 active
+  tab.dataset.seq = seq;
+  // 缩略图：单图用 fileUrl, PDF 用第一页 preview b64
+  let thumbSrc = "";
+  if (item.isPdf && item.previewPages[0]) {
+    thumbSrc = item.previewPages[0].b64;
+  } else if (item.fileUrl) {
+    thumbSrc = item.fileUrl;
+  }
+  const statusText = { pending: "待处理", processing: "处理中", done: "完成", error: "失败" }[item.status] || "处理中";
+  tab.innerHTML = `
+    ${thumbSrc ? `<img class="rs-tab-thumb" src="${escapeAttr(thumbSrc)}" alt="" />` : `<div class="rs-tab-thumb" style="display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--fg-dim);">${item.isPdf ? "PDF" : "IMG"}</div>`}
+    <div class="rs-tab-text">
+      <div class="rs-tab-num">#${seq}</div>
+      <div class="rs-tab-name" title="${escapeAttr(item.file.name)}">${escapeHtml(item.file.name)}</div>
+    </div>
+    <span class="rs-tab-status ${item.status}">${statusText}</span>
+  `;
+  tab.addEventListener("click", () => scrollToResult(seq));
+  // 取消之前的 active（最新加的在最前）
+  rsTabs.querySelectorAll(".rs-tab.active").forEach(t => t.classList.remove("active"));
+  rsTabs.appendChild(tab);
+  updateResultSwitcherNav();
+  // 滚动 tabs 到可见
+  tab.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+}
+
+function updateResultTab(seq, status) {
+  const tab = rsTabs.querySelector(`.rs-tab[data-seq="${seq}"]`);
+  if (!tab) return;
+  const statusEl = tab.querySelector(".rs-tab-status");
+  if (statusEl) {
+    statusEl.classList.remove("processing", "done", "error");
+    statusEl.classList.add(status);
+    statusEl.textContent = { processing: "处理中", done: "完成", error: "失败" }[status] || status;
+  }
+}
+
+function updateResultSwitcherNav() {
+  const all = Array.from(resultList.children);
+  const n = all.length;
+  rs.classList.toggle("show", n > 0);
+  rsInfo.textContent = `${n} / ${n}`;
+  rsPrev.disabled = true;  // scrollToResult 用 scrollIntoView, prev/next 暂简化
+  rsNext.disabled = true;
+}
+
+function scrollToResult(seq) {
+  const card = resultList.querySelector(`.result-card[data-seq="${seq}"]`);
+  if (!card) return;
+  // 滚动到该卡片（顶部留给 sticky header + switcher）
+  const rect = card.getBoundingClientRect();
+  const top = rect.top + window.scrollY - 110;
+  window.scrollTo({ top, behavior: "smooth" });
+  // 高亮闪烁
+  card.classList.remove("scroll-target");
+  void card.offsetWidth;  // 强制重排重启动画
+  card.classList.add("scroll-target");
+  setTimeout(() => card.classList.remove("scroll-target"), 1500);
+  // 更新 active 状态
+  rsTabs.querySelectorAll(".rs-tab").forEach(t => t.classList.toggle("active", Number(t.dataset.seq) === seq));
+}
+
+rsPrev.addEventListener("click", () => {
+  const all = Array.from(resultList.children);
+  const cur = rsTabs.querySelector(".rs-tab.active");
+  if (!cur || all.length === 0) return;
+  const curIdx = all.findIndex(c => Number(c.dataset.seq) === Number(cur.dataset.seq));
+  if (curIdx > 0) scrollToResult(Number(all[curIdx - 1].dataset.seq));
+});
+rsNext.addEventListener("click", () => {
+  const all = Array.from(resultList.children);
+  const cur = rsTabs.querySelector(".rs-tab.active");
+  if (!cur || all.length === 0) return;
+  const curIdx = all.findIndex(c => Number(c.dataset.seq) === Number(cur.dataset.seq));
+  if (curIdx < all.length - 1) scrollToResult(Number(all[curIdx + 1].dataset.seq));
+});
+
+function clearAllResultTabs() {
+  rsTabs.innerHTML = "";
+  rs.classList.remove("show");
+  rsInfo.textContent = "0 / 0";
+}
+
+// ===== 释放 (pagehide 显式 release, 不再依赖心跳) =====
+// 之前的实现是每 10s 发心跳 + 30s 超时 cleanup；现在简化为：
+//   - 处理中 → 把 user_id 加进 activeUserIds
+//   - 处理完 → 从 activeUserIds 移除
+//   - pagehide / beforeunload → sendBeacon 一次性 release 所有还在 active 的
+//   - visibilitychange hidden → 立即 release（避免浏览器强杀时漏发）
+function releaseAllUsers() {
+  if (activeUserIds.size === 0) return;
+  // sendBeacon 异步 POST, 即使 tab 正在被关也能送达
+  const ids = Array.from(activeUserIds);
+  for (const uid of ids) {
+    try {
+      const blob = new Blob([JSON.stringify({ user_id: uid })], { type: "application/json" });
+      navigator.sendBeacon("/api/release", blob);
+    } catch (e) { /* ignore */ }
+  }
+  activeUserIds.clear();
+}
+
+// tab 关 / 页面切走时主动 release
+window.addEventListener("pagehide", releaseAllUsers);
+window.addEventListener("beforeunload", releaseAllUsers);
+// 切到后台 tab 时（visibilitychange→hidden）立即 release — 浏览器强杀时
+// pagehide 可能来不及触发，visibilitychange 更可靠
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") {
+    releaseAllUsers();
+  }
+});
+
+// ===== 清空结果 =====
+function updateClearResultsBtn() {
+  const has = resultList.children.length > 0;
+  clearResultsBtn.style.display = has ? "" : "none";
+  if (has) {
+    clearResultsBtn.textContent = `清空结果 (${resultList.children.length})`;
+  }
+}
+clearResultsBtn.addEventListener("click", () => {
+  resultList.querySelectorAll("img[src^='blob:']").forEach(img => URL.revokeObjectURL(img.src));
+  resultList.innerHTML = "";
+  empty.style.display = "";
+  clearAllResultTabs();
+  updateClearResultsBtn();
+  // 注意：activeUserIds 不在这里清 — 完成的任务的 user_id 还可能再被刷新页面前端使用
+});
+const resultObserver = new MutationObserver(updateClearResultsBtn);
+resultObserver.observe(resultList, { childList: true });
+updateClearResultsBtn();
+</script>
+</body>
+</html>
