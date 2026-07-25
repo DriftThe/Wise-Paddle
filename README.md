@@ -36,9 +36,10 @@ VLPredictor（PaddleOCR-VL-1.6，按 label 分桶 batch 推理）
 **Python 依赖**：
 
 ```bash
-pip install fastapi uvicorn python-dotenv pydantic numpy opencv-python-headless Pillow torch transformers pymupdf
+pip install -r requirements.txt
 ```
-
+**Torch**：
+请根据Torch官方文档选择合适的下载方式,`requirements.txt`中默认为cuda13.2版本
 > 注意：`transformers` 需要 5.x 版本以支持 `AutoModelForImageTextToText`；项目内部包含了对 RoPE init 的兼容性补丁。
 
 ### 2. 下载模型
