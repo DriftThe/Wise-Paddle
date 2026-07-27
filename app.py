@@ -479,6 +479,8 @@ class OCRResponse(BaseModel):
     pool_free: int
     pages: list[OCRPage]
     regions: list[OCRRegion] = Field(default_factory=list)
+    # 前端 alive_check voucher；空表示未绑定
+    voucher_id: str = ""
 
 
 class HealthResponse(BaseModel):
@@ -563,6 +565,7 @@ def _decode_pdf_to_pil_pages(raw: bytes, dpi: float = 200.0) -> list:
 async def _process_pages(
         request_id: str,
         pil_pages: list,
+        voucher_id: str = "",
 ) -> tuple[list, float]:
     """把一组 PIL 图全部提交给 BatchScheduler，等所有 page 完成后合并结果。
 
@@ -570,6 +573,8 @@ async def _process_pages(
 
     CancelledError（来自 uvicorn 关 client 连接 / 服务 shutdown）时只 log + 重新抛出，
     pending job 不自动取消 —— 由调用方决定是否要外部清掉（自己实现离线检测逻辑）。
+    voucher_id 透传到 Job；前端的 alive_check 倒计时把 voucher 剔除时，
+    KickDeadUser 会调 scheduler.cancel_voucher(voucher_id) 把 pending + in-flight 都干掉。
     """
     if scheduler is None:
         raise HTTPException(status_code=503, detail="Scheduler 尚未初始化")
@@ -579,7 +584,10 @@ async def _process_pages(
     for idx, pil_img in enumerate(pil_pages):
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
-        job = scheduler.submit(request_id=request_id, page_index=idx, image=pil_img)
+        job = scheduler.submit(
+            request_id=request_id, page_index=idx, image=pil_img,
+            voucher_id=voucher_id,
+        )
         jobs.append(job)
 
     try:
@@ -591,8 +599,8 @@ async def _process_pages(
         # 注意：已经 submit 到 scheduler 但还没被 worker 拿走的 job 不会被取消，
         # 会继续被处理 —— 调 offline 检测的代码自行负责清理。
         queue_wait = time.perf_counter() - submit_t
-        logger.info("CANCEL: user=%s queue_wait=%.2fs (no auto-release)",
-                    request_id, queue_wait)
+        logger.info("CANCEL: user=%s voucher=%s queue_wait=%.2fs (no auto-release)",
+                    request_id, voucher_id, queue_wait)
         raise  # 让 handler 决定如何返回 200+cancelled
 
 
@@ -602,6 +610,7 @@ def _build_ocr_response_with_images(
         page_results: list,
         elapsed: float,
         queue_wait: float,
+        voucher_id: str = "",
 ) -> OCRResponse:
     all_regions: list[OCRRegion] = []
     out_pages: list[OCRPage] = []
@@ -638,6 +647,7 @@ def _build_ocr_response_with_images(
         pool_free=pool_ref.qsize() if pool_ref else 0,
         pages=out_pages,
         regions=all_regions,
+        voucher_id=voucher_id,
     )
 
 
@@ -672,20 +682,22 @@ async def ocr_upload(request: Request, file: UploadFile = File(...)):
     pil = _rgb_to_pil(rgb)
 
     request_id = request.query_params.get("user_id") or uuid.uuid4().hex[:8]
-    logger.info("UPLOAD: user=%s endpoint=/ocr/upload file=%s size=%d bytes mime=%s",
-                request_id, file.filename or "<unnamed>", len(raw), file.content_type or "?")
+    voucher_id = request.query_params.get("voucher_id") or ""
+    logger.info("UPLOAD: user=%s voucher=%s endpoint=/ocr/upload file=%s size=%d bytes mime=%s",
+                request_id, voucher_id, file.filename or "<unnamed>", len(raw), file.content_type or "?")
     st = time.perf_counter()
     try:
-        page_results, queue_wait = await _process_pages(request_id, [pil])
+        page_results, queue_wait = await _process_pages(request_id, [pil], voucher_id=voucher_id)
     except asyncio.CancelledError:
         elapsed = round(time.perf_counter() - st, 3)
-        logger.info("CANCEL: user=%s endpoint=/ocr/upload elapsed=%.2fs",
-                    request_id, elapsed)
+        logger.info("CANCEL: user=%s voucher=%s endpoint=/ocr/upload elapsed=%.2fs",
+                    request_id, voucher_id, elapsed)
         return JSONResponse(
             status_code=200,
             content={
                 "success": False,
                 "request_id": request_id,
+                "voucher_id": voucher_id,
                 "status": "cancelled",
                 "elapsed_seconds": elapsed,
                 "queue_wait_seconds": 0.0,
@@ -696,12 +708,34 @@ async def ocr_upload(request: Request, file: UploadFile = File(...)):
                 "regions": [],
             },
         )
+    # 同步响应场景：voucher 已被 KickDeadUser 剔除 → process_batch 给了 cancelled=True 空 PageResult
+    if page_results and page_results[0].cancelled:
+        elapsed = round(time.perf_counter() - st, 3)
+        logger.info("CANCEL_VOUCHER: user=%s voucher=%s endpoint=/ocr/upload elapsed=%.2fs",
+                    request_id, voucher_id, elapsed)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": False,
+                "request_id": request_id,
+                "voucher_id": voucher_id,
+                "status": "cancelled",
+                "elapsed_seconds": elapsed,
+                "queue_wait_seconds": round(queue_wait, 3),
+                "scheduler_pending": scheduler.pending_size() if scheduler else 0,
+                "pool_size": CFG.pool_size,
+                "pool_free": pool_ref.qsize() if pool_ref else 0,
+                "pages": [],
+                "regions": [],
+            },
+        )
     elapsed = time.perf_counter() - st
     n_regions = sum(len(p.regions) for p in page_results)
-    logger.info("COMPLETE: user=%s endpoint=/ocr/upload pages=1 regions=%d elapsed=%.2fs queue_wait=%.2fs",
-                request_id, n_regions, elapsed, queue_wait)
+    logger.info("COMPLETE: user=%s voucher=%s endpoint=/ocr/upload pages=1 regions=%d elapsed=%.2fs queue_wait=%.2fs",
+                request_id, voucher_id, n_regions, elapsed, queue_wait)
     return _build_ocr_response_with_images(
-        request_id, [pil], page_results, elapsed, queue_wait
+        request_id, [pil], page_results, elapsed, queue_wait,
+        voucher_id=voucher_id,
     )
 
 
@@ -714,20 +748,22 @@ async def ocr_base64(req: Base64Request, request: Request):
     pil = _rgb_to_pil(rgb)
 
     request_id = request.query_params.get("user_id") or uuid.uuid4().hex[:8]
-    logger.info("UPLOAD: user=%s endpoint=/ocr/base64 size=%d bytes (decoded=%dx%d)",
-                request_id, len(req.payload), rgb.shape[1], rgb.shape[0])
+    voucher_id = request.query_params.get("voucher_id") or ""
+    logger.info("UPLOAD: user=%s voucher=%s endpoint=/ocr/base64 size=%d bytes (decoded=%dx%d)",
+                request_id, voucher_id, len(req.payload), rgb.shape[1], rgb.shape[0])
     st = time.perf_counter()
     try:
-        page_results, queue_wait = await _process_pages(request_id, [pil])
+        page_results, queue_wait = await _process_pages(request_id, [pil], voucher_id=voucher_id)
     except asyncio.CancelledError:
         elapsed = round(time.perf_counter() - st, 3)
-        logger.info("CANCEL: user=%s endpoint=/ocr/base64 elapsed=%.2fs",
-                    request_id, elapsed)
+        logger.info("CANCEL: user=%s voucher=%s endpoint=/ocr/base64 elapsed=%.2fs",
+                    request_id, voucher_id, elapsed)
         return JSONResponse(
             status_code=200,
             content={
                 "success": False,
                 "request_id": request_id,
+                "voucher_id": voucher_id,
                 "status": "cancelled",
                 "elapsed_seconds": elapsed,
                 "queue_wait_seconds": 0.0,
@@ -738,25 +774,54 @@ async def ocr_base64(req: Base64Request, request: Request):
                 "regions": [],
             },
         )
+    if page_results and page_results[0].cancelled:
+        elapsed = round(time.perf_counter() - st, 3)
+        logger.info("CANCEL_VOUCHER: user=%s voucher=%s endpoint=/ocr/base64 elapsed=%.2fs",
+                    request_id, voucher_id, elapsed)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": False,
+                "request_id": request_id,
+                "voucher_id": voucher_id,
+                "status": "cancelled",
+                "elapsed_seconds": elapsed,
+                "queue_wait_seconds": round(queue_wait, 3),
+                "scheduler_pending": scheduler.pending_size() if scheduler else 0,
+                "pool_size": CFG.pool_size,
+                "pool_free": pool_ref.qsize() if pool_ref else 0,
+                "pages": [],
+                "regions": [],
+            },
+        )
     elapsed = time.perf_counter() - st
     n_regions = sum(len(p.regions) for p in page_results)
-    logger.info("COMPLETE: user=%s endpoint=/ocr/base64 pages=1 regions=%d elapsed=%.2fs queue_wait=%.2fs",
-                request_id, n_regions, elapsed, queue_wait)
+    logger.info("COMPLETE: user=%s voucher=%s endpoint=/ocr/base64 pages=1 regions=%d elapsed=%.2fs queue_wait=%.2fs",
+                request_id, voucher_id, n_regions, elapsed, queue_wait)
     return _build_ocr_response_with_images(
-        request_id, [pil], page_results, elapsed, queue_wait
+        request_id, [pil], page_results, elapsed, queue_wait,
+        voucher_id=voucher_id,
     )
 
 
 # ─── 路由：PDF 多页（流式 / 异步进度） ──────────────────────────────
-async def _run_pdf_batch(user_id: str, pil_pages: list) -> None:
-    """后台 task: 跑完 N 个 page, 每完成一页更新 _pdf_progress_store[user_id]"""
+async def _run_pdf_batch(user_id: str, pil_pages: list, voucher_id: str = "") -> None:
+    """后台 task: 跑完 N 个 page, 每完成一页更新 _pdf_progress_store[user_id]
+
+    voucher_id 透传到每个 Job；KickDeadUser 调 scheduler.cancel_voucher 后，pending
+    的 job fut 会被 cancel，in-flight 的会在 process_batch 里被过滤掉，page_result
+    标 cancelled=True 让 progress 反映这个状态。
+    """
     progress = _pdf_progress_store[user_id]
     jobs: list[Job] = []
     try:
         for idx, pil_img in enumerate(pil_pages):
             if pil_img.mode != "RGB":
                 pil_img = pil_img.convert("RGB")
-            job = scheduler.submit(request_id=user_id, page_index=idx, image=pil_img)
+            job = scheduler.submit(
+                request_id=user_id, page_index=idx, image=pil_img,
+                voucher_id=voucher_id,
+            )
             jobs.append(job)
 
         pending = {j.fut for j in jobs}
@@ -772,6 +837,15 @@ async def _run_pdf_batch(user_id: str, pil_pages: list) -> None:
                     if page_idx is None:
                         logger.error("PDF batch: fut not found (user=%s)", user_id)
                         continue
+                    if page_result.cancelled:
+                        # voucher 取消触发的空 PageResult —— 标记 progress 整批 cancelled
+                        progress["cancelled"] = True
+                        logger.info(
+                            "CANCEL_VOUCHER: user=%s voucher=%s endpoint=/ocr/pdf page=%d cancelled",
+                            user_id, voucher_id, page_idx,
+                        )
+                        # 继续等剩余的（可能也有 cancelled），不 break
+                        continue
                     page_dict = _make_pdf_page_dict(page_result, pil_pages[page_idx])
                     progress["pages"][page_idx] = page_dict
                     progress["done_count"] = len(progress["pages"])
@@ -780,8 +854,8 @@ async def _run_pdf_batch(user_id: str, pil_pages: list) -> None:
                     for j in jobs:
                         if not j.fut.done():
                             j.fut.cancel("cancelled")
-                    logger.info("CANCEL: user=%s endpoint=/ocr/pdf pages_pending=%d",
-                                user_id, len([j for j in jobs if not j.fut.done()]))
+                    logger.info("CANCEL: user=%s voucher=%s endpoint=/ocr/pdf pages_pending=%d",
+                                user_id, voucher_id, len([j for j in jobs if not j.fut.done()]))
                     return
                 except Exception as e:
                     logger.exception("PDF page failed: user=%s err=%s", user_id, e)
@@ -792,9 +866,14 @@ async def _run_pdf_batch(user_id: str, pil_pages: list) -> None:
     finally:
         progress["done"] = True
         progress["finished_at"] = time.time()
+        # 如果所有 page 都 cancelled（process_batch 给的 cancelled=True），整批算 cancelled
+        if progress["done_count"] == 0 and not progress.get("cancelled"):
+            # 还没设过 cancelled，但所有 page 都是空的 —— 几乎不会发生（除非 layout 完全没识别到任何 box）
+            # 不强制覆盖，留给"成功但无结果"的语义
+            pass
         logger.info(
-            "COMPLETE: user=%s endpoint=/ocr/pdf done=%d/%d wall=%.2fs cancelled=%s",
-            user_id, progress["done_count"], progress["total_pages"],
+            "COMPLETE: user=%s voucher=%s endpoint=/ocr/pdf done=%d/%d wall=%.2fs cancelled=%s",
+            user_id, voucher_id, progress["done_count"], progress["total_pages"],
             progress["finished_at"] - progress["started_at"],
             progress.get("cancelled", False),
         )
@@ -872,11 +951,13 @@ async def ocr_pdf(request: Request, file: UploadFile = File(...)):
         )
 
     user_id = request.query_params.get("user_id") or uuid.uuid4().hex[:8]
-    logger.info("UPLOAD: user=%s endpoint=/ocr/pdf file=%s size=%d bytes pages=%d dpi=%.0f",
-                user_id, file.filename or "<unnamed>", len(raw), len(pil_pages), CFG.pdf_dpi)
+    voucher_id = request.query_params.get("voucher_id") or ""
+    logger.info("UPLOAD: user=%s voucher=%s endpoint=/ocr/pdf file=%s size=%d bytes pages=%d dpi=%.0f",
+                user_id, voucher_id, file.filename or "<unnamed>", len(raw), len(pil_pages), CFG.pdf_dpi)
 
     async with _pdf_progress_lock:
         _pdf_progress_store[user_id] = {
+            "voucher_id": voucher_id,
             "total_pages": len(pil_pages),
             "pil_pages": pil_pages,
             "pages": {},
@@ -887,7 +968,7 @@ async def ocr_pdf(request: Request, file: UploadFile = File(...)):
             "error": None,
             "cancelled": False,
         }
-        task = asyncio.create_task(_run_pdf_batch(user_id, pil_pages))
+        task = asyncio.create_task(_run_pdf_batch(user_id, pil_pages, voucher_id))
         _pdf_progress_store[user_id]["task"] = task
 
     return JSONResponse(
@@ -895,6 +976,7 @@ async def ocr_pdf(request: Request, file: UploadFile = File(...)):
         content={
             "success": True,
             "request_id": user_id,
+            "voucher_id": voucher_id,
             "status": "processing",
             "total_pages": len(pil_pages),
             "poll_url": f"/api/ocr/pdf-status/{user_id}",
@@ -917,6 +999,7 @@ async def pdf_status(user_id: str):
             status_code=200,
             content={
                 "user_id": user_id,
+                "voucher_id": "",
                 "total_pages": 0,
                 "done": True,
                 "done_count": 0,
@@ -928,6 +1011,7 @@ async def pdf_status(user_id: str):
         status_code=200,
         content={
             "user_id": user_id,
+            "voucher_id": progress.get("voucher_id", ""),
             "total_pages": progress["total_pages"],
             "done": progress["done"],
             "done_count": progress["done_count"],
@@ -946,19 +1030,28 @@ aliveUsers = dict()
 async def AliveUserPend(request: AliveRequest):
     if request.aliveVoucher not in aliveUsers:
         logging.info(f"User \'{request.aliveVoucher}\' Logged in")
-        aliveUsers.update({request.aliveVoucher: 15})
+        aliveUsers.update({request.aliveVoucher: 7})
 
     else:
-        aliveUsers.update({request.aliveVoucher: 15})
+        aliveUsers.update({request.aliveVoucher: 7})
 
 
 async def KickDeadUser():
     while True:
         if aliveUsers:
-            for k, _v in aliveUsers.items():
+            # 用 list() 快照 —— 迭代中 del dict key 在 Python 3 上是 RuntimeError
+            for k, _v in list(aliveUsers.items()):
                 v = int(_v) - 1
                 aliveUsers.update({k: v})
-                if v == 0:
+                if v <= 0:
+                    # 倒计时归零 → voucher 失效
+                    # 1) 让 scheduler 清掉这个 voucher 的所有 pending + in-flight 工作
+                    if scheduler is not None:
+                        try:
+                            await scheduler.cancel_voucher(k)
+                        except Exception as e:
+                            logger.exception("cancel_voucher(%s) failed: %s", k, e)
+                    # 2) 删 dict 条目，释放
                     del aliveUsers[k]
                     logging.info(f"User \'{k}\' Lost Connection")
         else:

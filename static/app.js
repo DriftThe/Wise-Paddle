@@ -276,16 +276,24 @@ startBtn.addEventListener("click", async () => {
 });
 
 async function processOne(item) {
+    await waitForLegalVoucher();
     const t0 = performance.now();
     // 1) 立即建一个"处理中"placeholder card
     const ctl = buildPlaceholderCard(item);
     // 2) 申请一个 client-side user_id, 通过 query string 传给服务端做 per-user 输出隔离
     const clientUserId = `web-${uid()}`;
+    // 同时带上 session 级的 aliveVoucher（pollHealth 第一次拉 /health 时拿到）
+    // —— 服务端 KickDeadUser 倒计时归零时调 scheduler.cancel_voucher(aliveVoucher)，
+    // 把这个 voucher 名下所有 pending + in-flight 一起干掉
+    const url = item.isPdf ? "/ocr/pdf" : "/ocr/upload";
+    const qs = new URLSearchParams({
+        user_id: clientUserId,
+        voucher_id: aliveVoucher || "",
+    });
     try {
         const fd = new FormData();
         fd.append("file", item.file);
-        const url = item.isPdf ? "/ocr/pdf" : "/ocr/upload";
-        const r = await fetch(`${url}?user_id=${encodeURIComponent(clientUserId)}`,
+        const r = await fetch(`${url}?${qs.toString()}`,
             {method: "POST", body: fd, signal: AbortSignal.timeout(900_000)});
         const wallMs = performance.now() - t0;
         if (!r.ok) {
@@ -314,6 +322,12 @@ async function processOne(item) {
         item.status = "error";
         renderQueue();
         markCardError(ctl, String(e), performance.now() - t0);
+    }
+}
+
+async function waitForLegalVoucher() {
+    while (aliveVoucher === "" || aliveVoucher === null) {
+        await new Promise(resolve => setTimeout(resolve, 50));
     }
 }
 
