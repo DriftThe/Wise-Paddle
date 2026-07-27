@@ -362,11 +362,11 @@ class VLPredictor:
             dtype: torch.dtype = torch.bfloat16,
             max_new_tokens: int = 256,
             max_pixels: int = 1280 * 28 * 28,  # 官方默认 1MP（longest_edge）
-            min_pixels: int = 112896,         # 官方默认 shortest_edge
-            max_forward_batch: int = 10,       # 单次 VL forward 最多 image 数（显存上限）
+            min_pixels: int = 112896,  # 官方默认 shortest_edge
+            max_forward_batch: int = 10,  # 单次 VL forward 最多 image 数（显存上限）
             attn_impl: str = "sdpa",
             repetition_penalty: float = 1.15,  # 防止 batch 推理陷入重复循环
-            do_sample: bool = False,           # greedy 解码；想更"活"可以改 True
+            do_sample: bool = False,  # greedy 解码；想更"活"可以改 True
     ) -> None:
         logger.info("Loading VL model: %s", model_path)
         self.processor = AutoProcessor.from_pretrained(model_path)
@@ -524,7 +524,7 @@ class OCRPipeline:
             box_iou_threshold: float = 0.5,
             box_min_area: float = 16 * 16,
             box_min_score: float = 0.5,
-            box_unclip_ratio: float = 0.0,    # 0.05 = 每边向外扩 5%，提精度
+            box_unclip_ratio: float = 0.0,  # 0.05 = 每边向外扩 5%，提精度
             box_expand_pixels: float = 0.0,  # 额外每边扩 N 像素
             # ---- VLPredictor ----
             max_new_tokens: int = 256,
@@ -800,16 +800,8 @@ class BatchScheduler:
         * 第二轮：继续从 completed 最小的 user 拿，填满 max_batch
         * 效果：长任务（PDF 多页）不会独占 batch，新来的小任务能立刻被分到
 
-    取消语义（替代了之前的心跳机制）：
-        * release_user(user_id) — 由 app.py 在以下时机调用：
-          - 前端 pagehide 触发 sendBeacon /api/release
-          - HTTP handler 收到 CancelledError（tab 关 / 网络断 / 服务关闭）
-          一次性清掉该 user 的 pending + 已 in-flight 但还没 set_result 的 fut
-        * _cancel_all_pending — 关闭 scheduler 时清理
-        * 注意：in-flight（worker 已 take 走、process_batch 正在跑）的 job 不能
-          中断，只能让其自然完成；它的 fut 会被 cancel()，process_batch 完成后
-          set_result 不会触发 CancelledError 分支但 fut 已是 cancelled，调用方
-          catch CancelledError 时拿到的是原取消原因。
+    用户在线/离线检测 + 主动释放逻辑在调用方实现（v0.6 起由 app.py 自管）。
+    scheduler 只在 close() 时一次性取消所有 pending job。
     """
 
     def __init__(
@@ -879,42 +871,31 @@ class BatchScheduler:
     def pending_size(self) -> int:
         return self._pending_count
 
-    def active_user_count(self) -> int:
-        """当前还有 pending job 的 user 数（不算 in-flight 已被 worker 拿走的）。"""
-        return len(self._user_pending)
+    async def _cancel_all_pending(self, reason: str) -> None:
+        """一次性取消所有 user 的 pending job（仅在 close() 时调用）。
 
-    def release_user(self, request_id: str, reason: str = "tab closed") -> int:
-        """把指定 user 的所有 pending job 取消（Future 抛 CancelledError）。
-        已 in-flight（worker 已 take 走）的 job 不动，等其自然完成后再把 result 丢掉。
-        返回被取消的 job 数。
+        取消已经 submit 但 worker 还没 take 走的 job fut —— 调用方 catch 到
+        CancelledError 自然能感知。in-flight（worker 已 take 走）的 job 不动。
         """
-        return self._cancel_user_pending(request_id, reason)
-
-    def _cancel_user_pending(self, user: str, reason: str) -> int:
-        """实际取消 user pending queue 的所有 job。线程安全（仅操作同步状态）。"""
-        q = self._user_pending.get(user)
-        n = 0
-        if q:
+        total = 0
+        for u, q in list(self._user_pending.items()):
+            n = 0
             while q:
                 job = q.pop()
                 if not job.fut.done():
                     job.fut.cancel(reason)
                 n += 1
-            del self._user_pending[user]
             self._pending_count -= n
             if self._pending_count < 0:
                 self._pending_count = 0
-        # 唤醒所有 worker 重新检查 pending_count
-        self._wakeup.set()
-        if n:
-            logger.info("scheduler released user=%s, cancelled %d pending job(s) (%s)",
-                        user, n, reason)
-        return n
-
-    async def _cancel_all_pending(self, reason: str) -> None:
-        users = list(self._user_pending.keys())
-        for u in users:
-            self._cancel_user_pending(u, reason)
+            total += n
+            if n:
+                logger.info("scheduler cancelled user=%s, %d pending job(s) (%s)",
+                            u, n, reason)
+        if total:
+            self._wakeup.set()
+            logger.info("scheduler cancelled all pending: %d total job(s) (%s)",
+                        total, reason)
 
     def _take_fair_batch(self, max_n: int) -> list:
         """max-min fair 选 batch：优先选 '已完成数最少' 的 user。

@@ -3,12 +3,10 @@ Wise-Paddle uvicorn 服务（生产落地版：.env 驱动 + 显式 cleanup，�
 
 设计要点：
 - 单 pipeline 一次处理一批（最多 BATCH_MAX 张图）
-- BatchScheduler 跨用户聚合 page 任务送给 pipeline
+- BatchScheduler 跨用户聚合 page 任务送给 pipeline（max-min fair）
 - layout detection 和 VL 推理都能 batch 起来
-- 每个 request 唯一 user_id (request_id)；客户端通过 /api/release 显式释放
-  （前端在 pagehide / beforeunload 时 sendBeacon 触发）
-- 服务端在 HTTP handler 收到 CancelledError 时也调用 release_user() 兜底
-  —— 替代了之前的心跳+cleanup_loop 机制
+- 每个 request 唯一 user_id (request_id)，用于 per-user 输出子目录隔离
+- 用户在线/离线检测逻辑由调用方自行实现 —— 服务端不做自动取消
 
 HTTP 接口：
 - GET  /                          —— 前端 UI（单页 HTML）
@@ -17,7 +15,6 @@ HTTP 接口：
 - POST /ocr/base64                —— base64 JSON body，返回 1 个 OCRPage
 - POST /ocr/pdf                   —— 上传 PDF，转 N 页 PNG 入队，返回 N 个 OCRPage
 - GET  /api/ocr/pdf-status/{uid}  —— 轮询 PDF 进度
-- POST /api/release               —— 主动释放 user 所有 pending，body: {"user_id": "..."}
 
 所有可调参数从 .env 读取（见 .env.example），影响：
 - 显存：PIPELINE_POOL_SIZE, BATCH_MAX, VL_MAX_PIXELS, VL_MIN_PIXELS, ATTN_IMPL, DTYPE
@@ -52,7 +49,7 @@ import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
@@ -129,7 +126,7 @@ class Config:
     box_expand_pixels: float = _env_float("BOX_EXPAND_PIXELS", 4.0)
 
     # ---- 精度（VL）----
-    vl_min_pixels: int = _env_int("VL_MIN_PIXELS", 112896)         # shortest_edge
+    vl_min_pixels: int = _env_int("VL_MIN_PIXELS", 112896)  # shortest_edge
     vl_max_pixels: int = _env_int("VL_MAX_PIXELS", 1280 * 28 * 28)  # longest_edge (≈ 1MP)
     vl_repetition_penalty: float = _env_float("VL_REPETITION_PENALTY", 1.15)
     vl_do_sample: bool = _env_bool("VL_DO_SAMPLE", False)
@@ -138,7 +135,7 @@ class Config:
     vl_max_forward_batch: int = _env_int("VL_MAX_FORWARD_BATCH", 4)  # 单次 VL forward image 上限
     vl_max_new_tokens: int = _env_int("VL_MAX_NEW_TOKENS", 256)
     vl_attn_impl: str = _env_str("ATTN_IMPL", "sdpa")  # sdpa | eager
-    vl_dtype: str = _env_str("DTYPE", "bfloat16")      # bfloat16 | float16 | float32
+    vl_dtype: str = _env_str("DTYPE", "bfloat16")  # bfloat16 | float16 | float32
 
     # ---- 速度（pipeline）----
     max_regions: int = _env_int("MAX_REGIONS", 100)  # 单页最多送 VL 的 region 数
@@ -182,6 +179,7 @@ class _DailyFileHandler(logging.FileHandler):
     - 不依赖 suffix 改名, 直接换 baseFilename
     - 旧文件永久保留, 由 _cleanup_old_logs 启动时按 LOG_KEEP_DAYS 删
     """
+
     def __init__(self, log_dir: Path, prefix: str = "server", encoding: str = "utf-8"):
         self._log_dir = Path(log_dir)
         self._log_dir.mkdir(parents=True, exist_ok=True)
@@ -260,7 +258,6 @@ def _setup_logging() -> None:
 
 _setup_logging()
 logger = logging.getLogger("wise-paddle")
-
 
 # ─── 全局服务对象（lifespan 里初始化） ────────────────────────────
 scheduler: Optional[BatchScheduler] = None
@@ -429,7 +426,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+# 静态资源挂载在文件末尾 — 必须放在所有 @app.get/post 之后，
+# 否则 mount 会优先匹配并吞掉 API 路由。
 
 
 # ─── 全局错误处理：未捕获的异常 → 500 + JSON ────────────────────
@@ -484,16 +484,6 @@ class HealthResponse(BaseModel):
     pool_free: int
     scheduler_pending: int
     batch_max: int
-    active_users: int  # 仍有 pending job 的 user 数
-
-
-class ReleaseRequest(BaseModel):
-    user_id: str = Field(..., min_length=1, max_length=64)
-
-
-class ReleaseResponse(BaseModel):
-    ok: bool
-    cancelled: int
 
 
 # ─── 工具函数 ────────────────────────────────────────────────────
@@ -564,18 +554,6 @@ def _decode_pdf_to_pil_pages(raw: bytes, dpi: float = 200.0) -> list:
     return pages
 
 
-def _release_user_silent(user_id: str, reason: str) -> int:
-    """同步、安全地释放一个 user 的所有 pending + in-flight job。
-    任何 handler 收到 CancelledError 时都该调这个。返回被取消的 pending 数。"""
-    if scheduler is None:
-        return 0
-    try:
-        return scheduler.release_user(user_id, reason=reason)
-    except Exception as e:
-        logger.exception("release_user failed for %s: %s", user_id, e)
-        return 0
-
-
 # ─── 核心：把 N 个 PIL page 提交到 scheduler，等所有完成 ────────────
 async def _process_pages(
         request_id: str,
@@ -584,7 +562,9 @@ async def _process_pages(
     """把一组 PIL 图全部提交给 BatchScheduler，等所有 page 完成后合并结果。
 
     返回 (list[PageResult], queue_wait_seconds)
-    CancelledError 兜底：释放该 user 的所有 pending，wakeup worker 重新拼批。
+
+    CancelledError（来自 uvicorn 关 client 连接 / 服务 shutdown）时只 log + 重新抛出，
+    pending job 不自动取消 —— 由调用方决定是否要外部清掉（自己实现离线检测逻辑）。
     """
     if scheduler is None:
         raise HTTPException(status_code=503, detail="Scheduler 尚未初始化")
@@ -602,13 +582,12 @@ async def _process_pages(
         queue_wait = time.perf_counter() - submit_t
         return list(pages), queue_wait
     except asyncio.CancelledError:
-        # 关 tab / 网络断 / 服务关闭 都会让 CancelledError 冒上来
-        # 关键：必须 release_user()，否则 fut.cancel() 只是本地层取消，
-        # _user_pending 里的 Job 还在队列，worker 还是会去跑、浪费 GPU
-        n = _release_user_silent(request_id, reason="cancelled by client/server")
+        # CancelledError 不再做自动释放；调用方可在 handler 层加自己的策略。
+        # 注意：已经 submit 到 scheduler 但还没被 worker 拿走的 job 不会被取消，
+        # 会继续被处理 —— 调 offline 检测的代码自行负责清理。
         queue_wait = time.perf_counter() - submit_t
-        logger.info("CANCEL: user=%s pages_pending_cancelled=%d queue_wait=%.2fs",
-                    request_id, n, queue_wait)
+        logger.info("CANCEL: user=%s queue_wait=%.2fs (no auto-release)",
+                    request_id, queue_wait)
         raise  # 让 handler 决定如何返回 200+cancelled
 
 
@@ -657,12 +636,7 @@ def _build_ocr_response_with_images(
     )
 
 
-# ─── 路由：根 / 健康 ──────────────────────────────────────────────
-@app.get("/", include_in_schema=False)
-async def index():
-    return FileResponse(str(STATIC_DIR / "index.html"))
-
-
+# ─── 路由：健康 ───────────────────────────────────────────────────
 @app.get("/health", response_model=HealthResponse)
 async def health():
     return HealthResponse(
@@ -672,7 +646,6 @@ async def health():
         pool_free=pool_ref.qsize() if pool_ref else 0,
         scheduler_pending=scheduler.pending_size() if scheduler else 0,
         batch_max=CFG.batch_max,
-        active_users=scheduler.active_user_count() if scheduler else 0,
     )
 
 
@@ -959,31 +932,10 @@ async def pdf_status(user_id: str):
     )
 
 
-# ─── 路由：释放（前端 pagehide 时 sendBeacon 调用） ─────────────
-@app.post("/api/release", response_model=ReleaseResponse)
-async def api_release(req: ReleaseRequest):
-    """前端在 pagehide / beforeunload 时 sendBeacon 调用。
-
-    一次性清掉该 user 的：
-    - BatchScheduler 里所有 pending job（Fut 抛 CancelledError）
-    - _pdf_progress_store 里对应的 PDF 后台 task
-    - pdf_progress['cancelled'] 标记，让前端轮询能识别"已取消"
-    """
-    if scheduler is None:
-        raise HTTPException(status_code=503, detail="Scheduler 尚未初始化")
-    cancelled = scheduler.release_user(req.user_id, reason="client released")
-    progress = _pdf_progress_store.get(req.user_id)
-    pdf_task_cancelled = False
-    if progress:
-        task = progress.get("task")
-        if task is not None and not task.done():
-            task.cancel()
-            pdf_task_cancelled = True
-        progress["cancelled"] = True
-    logger.info("RELEASE: user=%s scheduler_cancelled=%d pdf_task_cancelled=%s",
-                req.user_id, cancelled, pdf_task_cancelled)
-    return ReleaseResponse(ok=True, cancelled=cancelled)
-
+# ─── 静态资源挂载（catch-all）────────────────────────────────────
+# html=True 让 `/` 自动返回 index.html；其它路径尝试匹配 static/ 下的文件。
+# 必须放在所有 API 路由注册之后，否则会拦截 API 请求。
+app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
 
 # ─── 启动入口 ────────────────────────────────────────────────────
 if __name__ == "__main__":

@@ -19,8 +19,7 @@
 //  14. 错误状态 (markCardError)
 //  15. 框绘制 / 命中测试 (hitTestBox / drawBoxes)
 //  16. 多结果导航 (result-switcher)
-//  17. pagehide / visibilitychange 主动 release
-//  18. 清空结果
+//  17. 清空结果
 // ============================================================================
 "use strict";
 
@@ -48,11 +47,6 @@ const rsPrev = $("#rs-prev");
 const rsNext = $("#rs-next");
 const rsInfo = $("#rs-info");
 let resultSeq = 0;
-// user_id → request_id 映射; 每个 queue item 一个 user_id
-// 当前还在处理的 user_id 集合。
-// 释放时机：处理完 / 失败 / pagehide / beforeunload（仅"真关 tab"）。
-// 注意：visibilitychange→hidden -> 不释放任务 — 切到后台 tab 是正常行为，任务应继续跑。
-const activeUserIds = new Set();
 
 // ===== 队列状态 =====
 /**
@@ -255,10 +249,8 @@ async function processOne(item) {
     const t0 = performance.now();
     // 1) 立即建一个"处理中"placeholder card
     const ctl = buildPlaceholderCard(item);
-    // 2) 申请一个 client-side user_id, 通过 query string 传给服务端
-    //    (服务端用这个 user_id 做 scheduler key + release 标识)
+    // 2) 申请一个 client-side user_id, 通过 query string 传给服务端做 per-user 输出隔离
     const clientUserId = `web-${uid()}`;
-    activeUserIds.add(clientUserId);
     try {
         const fd = new FormData();
         fd.append("file", item.file);
@@ -271,13 +263,6 @@ async function processOne(item) {
             item.status = "error";
             renderQueue();
             markCardError(ctl, err.detail || `HTTP ${r.status}`, wallMs);
-            // 失败时也要释放 user_id（不会再有结果）
-            activeUserIds.delete(clientUserId);
-            try {
-                const blob = new Blob([JSON.stringify({user_id: clientUserId})], {type: "application/json"});
-                navigator.sendBeacon("/api/release", blob);
-            } catch (e) {
-            }
             return;
         }
         const data = await r.json();
@@ -293,19 +278,12 @@ async function processOne(item) {
             const wallMs = performance.now() - t0;
             item.status = "done";
             renderQueue();
-            activeUserIds.delete(clientUserId);
             fillCardWithResult(ctl, item, data, wallMs);
         }
     } catch (e) {
         item.status = "error";
         renderQueue();
         markCardError(ctl, String(e), performance.now() - t0);
-        activeUserIds.delete(clientUserId);
-        try {
-            const blob = new Blob([JSON.stringify({user_id: clientUserId})], {type: "application/json"});
-            navigator.sendBeacon("/api/release", blob);
-        } catch (e) {
-        }
     }
 }
 
@@ -364,11 +342,10 @@ async function pollPdfProgress(ctl, item, userId, initData, t0) {
                 const wallMs = performance.now() - t0;
                 item.status = (data.cancelled || data.error) ? "error" : "done";
                 renderQueue();
-                activeUserIds.delete(userId);
                 if (data.error) {
                     markCardError(ctl, data.error, wallMs);
                 } else if (data.cancelled) {
-                    markCardError(ctl, "客户端取消 / 心跳超时", wallMs);
+                    markCardError(ctl, "服务端取消", wallMs);
                 }
                 // 切所有未完成 page-slot 状态
                 for (let i = 0; i < ctl.totalPages; i++) {
@@ -981,34 +958,6 @@ function clearAllResultTabs() {
     rsInfo.textContent = "0 / 0";
 }
 
-// ===== 释放（只在真关 tab 时） =====
-// 机制：处理中 → user_id 加进 activeUserIds；处理完 → 移除。
-// 释放时机：
-//   - pagehide / beforeunload：真关 tab / 关浏览器 / 关页面
-//   - 处理完成 / 失败：立即从集合移除
-// 切到后台 tab（visibilitychange→hidden）**不**释放，任务继续跑；切回来页面就是更新的。
-// 浏览器强杀时 pagehide 可能没机会发 sendBeacon，此时任务会在服务端跑完（GPU 占一点时间，
-// 但 max-min fair 保证新用户不会被卡）。
-function releaseAllUsers() {
-    if (activeUserIds.size === 0) return;
-    // sendBeacon 异步 POST, 即使 tab 正在被关也能送达
-    const ids = Array.from(activeUserIds);
-    for (const uid of ids) {
-        try {
-            const blob = new Blob([JSON.stringify({user_id: uid})], {type: "application/json"});
-            navigator.sendBeacon("/api/release", blob);
-        } catch (e) { /* ignore */
-        }
-    }
-    activeUserIds.clear();
-}
-
-// tab 关 / 页面关时主动 release
-window.addEventListener("pagehide", releaseAllUsers);
-window.addEventListener("beforeunload", releaseAllUsers);
-// 注意：切到后台 tab（visibilitychange→hidden）不释放，任务继续跑
-// 之前的版本在这里也 release，错误地把"切后台"当成"关 tab"处理
-
 // ===== 清空结果 =====
 function updateClearResultsBtn() {
     const has = resultList.children.length > 0;
@@ -1024,7 +973,6 @@ clearResultsBtn.addEventListener("click", () => {
     empty.style.display = "";
     clearAllResultTabs();
     updateClearResultsBtn();
-    // 注意：activeUserIds 不在这里清 — 完成的任务的 user_id 还可能再被刷新页面前端使用
 });
 const resultObserver = new MutationObserver(updateClearResultsBtn);
 resultObserver.observe(resultList, {childList: true});
