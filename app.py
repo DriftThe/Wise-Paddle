@@ -370,7 +370,7 @@ async def lifespan(app: FastAPI):
     )
     # 启动时清一次旧 log
     _cleanup_old_logs(CFG.log_keep_days)
-
+    alive_check_task = asyncio.create_task(KickDeadUser())
     pool = PipelinePool(size=CFG.pool_size, factory=_make_pipeline)
     await pool.init()
     pool_ref = pool
@@ -447,6 +447,10 @@ class Base64Request(BaseModel):
     payload: str = Field(..., description="图片 base64 字符串，可带 data URI 前缀")
 
 
+class AliveRequest(BaseModel):
+    aliveVoucher: str
+
+
 class OCRRegion(BaseModel):
     page_index: int = 0
     box_index: int = 0
@@ -484,6 +488,7 @@ class HealthResponse(BaseModel):
     pool_free: int
     scheduler_pending: int
     batch_max: int
+    alive_voucher: str
 
 
 # ─── 工具函数 ────────────────────────────────────────────────────
@@ -646,6 +651,7 @@ async def health():
         pool_free=pool_ref.qsize() if pool_ref else 0,
         scheduler_pending=scheduler.pending_size() if scheduler else 0,
         batch_max=CFG.batch_max,
+        alive_voucher=uuid.uuid4().hex[:8]
     )
 
 
@@ -930,6 +936,34 @@ async def pdf_status(user_id: str):
             "pages": dict(progress["pages"]),
         },
     )
+
+
+# ──────路由: 存活检查────────────────────────────────
+aliveUsers = dict()
+
+
+@app.post("/alive")
+async def AliveUserPend(request: AliveRequest):
+    if request.aliveVoucher not in aliveUsers:
+        logging.info(f"User \'{request.aliveVoucher}\' Logged in")
+        aliveUsers.update({request.aliveVoucher: 15})
+
+    else:
+        aliveUsers.update({request.aliveVoucher: 15})
+
+
+async def KickDeadUser():
+    while True:
+        if aliveUsers:
+            for k, _v in aliveUsers.items():
+                v = int(_v) - 1
+                aliveUsers.update({k: v})
+                if v == 0:
+                    del aliveUsers[k]
+                    logging.info(f"User \'{k}\' Lost Connection")
+        else:
+            pass
+        await asyncio.sleep(1)
 
 
 # ─── 静态资源挂载（catch-all）────────────────────────────────────

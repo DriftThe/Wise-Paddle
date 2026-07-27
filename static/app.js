@@ -46,6 +46,7 @@ const rsTabs = $("#rs-tabs");
 const rsPrev = $("#rs-prev");
 const rsNext = $("#rs-next");
 const rsInfo = $("#rs-info");
+let aliveVoucher = ""; // 确认存活的唯一ID
 let resultSeq = 0;
 
 // ===== 队列状态 =====
@@ -96,20 +97,49 @@ async function copyText(text, silent = false) {
 }
 
 // ===== Health polling =====
+const heathLoopID = setInterval(pollHealth, 1500);
+
 async function pollHealth() {
     try {
-        const r = await fetch("/health");
-        const d = await r.json();
-        $("#stat-pool").textContent = `${d.pool_free}/${d.pool_size}`;
-        $("#stat-pending").textContent = d.scheduler_pending;
-        $("#stat-batch").textContent = d.batch_max;
+        if (aliveVoucher === "") {
+            const r = await fetch("/health");
+            const d = await r.json();
+            $("#stat-pool").textContent = `${d.pool_free}/${d.pool_size}`;
+            $("#stat-pending").textContent = d.scheduler_pending;
+            $("#stat-batch").textContent = d.batch_max;
+            aliveVoucher = d.alive_voucher;
+            // $("#alive-keeping-id").textContent = aliveVoucher;
+            console.log(aliveVoucher);
+            clearInterval(heathLoopID);
+            const aliveLoopID = setInterval(KeepAlive, 5000);
+            await KeepAlive();
+        } else {
+            // clearInterval(heathLoopID);
+        }
     } catch (e) { /* ignore */
-        showToast("404 - 与主机失去连接", true)
+        console.log(e)
+        showToast("404 - 与主机失去连接", true);
     }
 }
 
-setInterval(pollHealth, 1500);
 pollHealth();
+
+// ===== Connection Alive Prove =====
+async function KeepAlive() {
+    try {
+        const response = await fetch("/alive", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                aliveVoucher: aliveVoucher,
+            })
+        });
+    } catch (e) {
+        showToast("404 - 与主机失去连接", true);
+    }
+}
 
 // ===== PDF 占位抽帧（不占 GPU，几百 ms） =====
 async function renderPdfPages(pdfFile, maxW = 1000) {
