@@ -668,6 +668,7 @@ class OCRPipeline:
             self,
             jobs: list[Job],
             cancelled_vouchers: Optional[set] = None,
+            cancelled_requests: Optional[set] = None,
     ) -> list[PageResult]:
         """一次处理 N 张图（跨用户共享 layout + VL 推理）。
 
@@ -678,7 +679,8 @@ class OCRPipeline:
         4) markdown 落盘到各自 request_id/ 子目录，返回 PageResult
 
         cancelled_vouchers —— 被 BatchScheduler.cancel_voucher 标记过的 voucher 集合。
-        两层过滤：
+        cancelled_requests —— 被 BatchScheduler.cancel_request 标记过的 request_id 集合。
+        两层过滤（合并两个集合）：
         - 入口（防御 take_batch 后才 cancel 的情况）
         - crop 之后、VL 之前（处理"layout 完成了但还没 VL"的 crops）
         命中过滤的 job 返回 cancelled=True 的空 PageResult，不调 VL、不写盘。
@@ -687,6 +689,15 @@ class OCRPipeline:
             return []
         if cancelled_vouchers is None:
             cancelled_vouchers = set()
+        if cancelled_requests is None:
+            cancelled_requests = set()
+
+        def _is_cancelled(j: "Job") -> bool:
+            if j.voucher_id and j.voucher_id in cancelled_vouchers:
+                return True
+            if j.request_id and j.request_id in cancelled_requests:
+                return True
+            return False
         st = time.perf_counter()
         self._ensure_output_dir()
 
@@ -697,11 +708,11 @@ class OCRPipeline:
 
         n = len(jobs)
 
-        # --- 第 1 次过滤：入口 --- 拒掉 voucher 已取消的
+        # --- 第 1 次过滤：入口 --- 拒掉 voucher / request 已取消的
         # 保留原 jobs 列表的索引位置，结果按原顺序回填
         active1_idx: list[int] = [
             i for i, j in enumerate(jobs)
-            if not (j.voucher_id and j.voucher_id in cancelled_vouchers)
+            if not _is_cancelled(j)
         ]
         if not active1_idx:
             return [self._empty_page_result(j) for j in jobs]
@@ -725,11 +736,11 @@ class OCRPipeline:
             crops_per_page.append(crops)
 
         # --- 第 2 次过滤：crop 之后、VL 之前 ---
-        # cancel_voucher 在 process_batch 运行期间被另一个线程（GIL 切换）调时，
-        # 这次过滤能捕到（在 entry 和 crop 之间发生了 cancel）
+        # cancel_voucher / cancel_request 在 process_batch 运行期间被另一个线程
+        # （GIL 切换）调时，这次过滤能捕到（在 entry 和 crop 之间发生了 cancel）
         active2_idx_in_a1: list[int] = [
             i for i, j in enumerate(active1_jobs)
-            if not (j.voucher_id and j.voucher_id in cancelled_vouchers)
+            if not _is_cancelled(j)
         ]
         if not active2_idx_in_a1:
             # 全部被第 2 次过滤掉
@@ -910,6 +921,10 @@ class BatchScheduler:
         # 在 crop 之后、VL 之前被丢掉；VL 已经发起的那次 forward 跑完但结果不写盘。
         # 该 set 只增不删（voucher 短，几千条也才 KB 级，不回收）
         self._cancelled_vouchers: set[str] = set()
+        # request 取消追踪：同上，但按 request_id（也就是 user_id / 单次 upload）。
+        # 跟 voucher 取消是两套独立维度 —— 前者是"用户离线全部清"，后者是"前端点
+        # remove 只清这一条"。同时在两层过滤里 union 取并集。
+        self._cancelled_requests: set[str] = set()
 
     async def start(self) -> None:
         logger.info(
@@ -1017,6 +1032,58 @@ class BatchScheduler:
             logger.info(
                 "scheduler marked voucher=%s as cancelled (no pending; in-flight will be dropped at next filter)",
                 voucher_id,
+            )
+        return cancelled_count
+
+    async def cancel_request(self, request_id: str) -> int:
+        """一次性取消 request_id 的所有 pending + in-flight 工作。
+
+        跟 cancel_voucher 是平行的两个维度：voucher 是"用户离线全部清"，
+        request 是"前端点 remove 只清这一条"。
+
+        行为：
+        1) 遍历所有 user 的 pending 队列，fut.cancel() 该 request_id 的 job
+        2) 把 request_id 加进 _cancelled_requests；worker 在调 process_batch 时
+           把这个 set 传进去，pipeline 在入口 + crop 之后两层过滤掉同 request 的 job
+        3) _wakeup.set() 唤醒 worker
+
+        返回被取消的 pending job 数。
+        """
+        if not request_id:
+            return 0
+        cancelled_count = 0
+        async with self._lock:
+            for u, q in list(self._user_pending.items()):
+                kept: list[Job] = []
+                user_cancelled = 0
+                while q:
+                    job = q.popleft()
+                    if job.request_id == request_id and not job.fut.done():
+                        job.fut.cancel(f"request cancelled: {request_id}")
+                        user_cancelled += 1
+                    else:
+                        kept.append(job)
+                for j in reversed(kept):
+                    q.appendleft(j)
+                if not q:
+                    self._user_pending.pop(u, None)
+                cancelled_count += user_cancelled
+            if cancelled_count:
+                self._pending_count -= cancelled_count
+                if self._pending_count < 0:
+                    self._pending_count = 0
+            # 标记 request 已取消（worker 下一批 process_batch 入口 + crop 之后会看到）
+            self._cancelled_requests.add(request_id)
+        self._wakeup.set()
+        if cancelled_count:
+            logger.info(
+                "scheduler cancelled request=%s, %d pending job(s); in-flight will be dropped at next filter",
+                request_id, cancelled_count,
+            )
+        else:
+            logger.info(
+                "scheduler marked request=%s as cancelled (no pending; in-flight will be dropped at next filter)",
+                request_id,
             )
         return cancelled_count
 
@@ -1160,10 +1227,11 @@ class BatchScheduler:
                     user_in_batch_count,
                 )
                 from starlette.concurrency import run_in_threadpool
-                # 把 _cancelled_vouchers 传给 pipeline.process_batch，
-                # 让 entry + crop 之后两层过滤掉 voucher 已取消的 job
+                # 把 _cancelled_vouchers + _cancelled_requests 都传给 pipeline.process_batch，
+                # 让 entry + crop 之后两层过滤掉 voucher / request 已取消的 job
                 results = await run_in_threadpool(
-                    pipe.process_batch, batch, self._cancelled_vouchers,
+                    pipe.process_batch, batch,
+                    self._cancelled_vouchers, self._cancelled_requests,
                 )
             dt = time.perf_counter() - t0
             # 5) 更新每个 user 的已完成数（用于下次 fair 排序）

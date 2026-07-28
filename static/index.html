@@ -219,6 +219,20 @@
             color: #fff;
         }
 
+        .queue-item .badge.cancelled {
+            background: var(--fg-dim);
+            color: var(--bg);
+            opacity: 0.85;
+        }
+
+        .queue-item.cancelled {
+            opacity: 0.6;
+        }
+
+        .queue-item.cancelled::after {
+            display: none;
+        }
+
         .queue-item .pages-tag {
             position: absolute;
             top: 4px;

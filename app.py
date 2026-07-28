@@ -863,6 +863,19 @@ async def _run_pdf_batch(user_id: str, pil_pages: list, voucher_id: str = "") ->
     except Exception as e:
         logger.exception("PDF batch crashed: user=%s", user_id)
         progress["error"] = str(e)
+    except asyncio.CancelledError:
+        # 整个 _run_pdf_batch task 自身被 cancel（来自 /api/cancel/{user_id}）
+        # —— 标记 progress 为 cancelled，并把还没 done 的 job fut 也 cancel 掉，
+        # 让 worker 的 set_result 跳过它们
+        progress["cancelled"] = True
+        for j in jobs:
+            if not j.fut.done():
+                j.fut.cancel("request cancelled")
+        logger.info(
+            "CANCEL: user=%s voucher=%s endpoint=/ocr/pdf pages_pending=%d (task cancelled)",
+            user_id, voucher_id, len([j for j in jobs if not j.fut.done()]),
+        )
+        raise  # 让 framework 看到 cancellation
     finally:
         progress["done"] = True
         progress["finished_at"] = time.time()
@@ -1020,6 +1033,54 @@ async def pdf_status(user_id: str):
             "pages": dict(progress["pages"]),
         },
     )
+
+
+# ─── 主动取消：前端点 remove 按钮时发起的 cancel ─────────────────
+@app.post("/api/cancel/{user_id}")
+async def cancel_user_request(user_id: str):
+    """主动取消某个 upload（user_id）的所有 pending + in-flight 工作。
+
+    跟 /alive 倒计时触发的 voucher 取消是两套独立机制：
+    - voucher 取消 → KickDeadUser → cancel_voucher(voucher_id) → 清整个 session
+    - request 取消 → 本端点 → cancel_request(user_id) → 只清这一条 upload
+
+    行为：
+    1) scheduler.cancel_request(user_id) 取消该 request_id 的 pending job fut，
+       并把 request_id 加进 _cancelled_requests，worker 下一批 process_batch
+       会在 entry + crop 之后两层过滤掉它
+    2) 如果是 PDF（_pdf_progress_store 里有这条），task.cancel() 取消后台 task，
+       并把 progress["cancelled"] = True，前端下次 poll 立刻看到
+    3) 单图同步响应路径：handler 仍在 await asyncio.gather，fut.cancel() 后
+       gather 会抛 CancelledError，handler 返回 200 cancelled
+    """
+    if scheduler is None:
+        raise HTTPException(status_code=503, detail="Scheduler 尚未初始化")
+
+    cancelled = await scheduler.cancel_request(user_id)
+
+    pdf_cancelled = False
+    pdf_had_progress = False
+    if user_id in _pdf_progress_store:
+        pdf_had_progress = True
+        prog = _pdf_progress_store[user_id]
+        task = prog.get("task")
+        if task is not None and not task.done():
+            task.cancel()
+            pdf_cancelled = True
+        # 即使 task 还没起来 / 已经结束，也置 cancelled，让 poll 立刻感知
+        prog["cancelled"] = True
+
+    logger.info(
+        "CANCEL_REQ: user=%s cancelled_pending=%d pdf_had=%s pdf_cancelled=%s",
+        user_id, cancelled, pdf_had_progress, pdf_cancelled,
+    )
+    return {
+        "success": True,
+        "user_id": user_id,
+        "cancelled_pending": cancelled,
+        "pdf_had_progress": pdf_had_progress,
+        "pdf_cancelled": pdf_cancelled,
+    }
 
 
 # ──────路由: 存活检查────────────────────────────────

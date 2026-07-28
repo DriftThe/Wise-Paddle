@@ -1,5 +1,5 @@
 // ============================================================================
-// Wise-Paddle · 前端逻辑
+// Wise-Paddle · 前端逻辑  v0.5.1  (含主动 cancel 路径，2026-07-28)
 // ----------------------------------------------------------------------------
 // 配套 HTML: static/index.html
 // 入口顺序（按代码出现顺序）:
@@ -9,17 +9,22 @@
 //   4. /health 轮询
 //   5. PDF 占位抽帧
 //   6. 拖拽 / 文件输入
-//   7. 队列渲染 / 清空
-//   8. 开始处理 / processOne
-//   9. PDF 流式轮询 (pollPdfProgress)
+//   7. 队列渲染 / 清空 (remove 按钮：pending→仅删；processing→主动 cancel 路径)
+//   8. 开始处理 / processOne (给 item 存 userId/ctl/abortCtl/pollAbort 给 §7 用)
+//   9. PDF 流式轮询 (pollPdfProgress) 顶部检查 item.pollAbort
 //  10. 增量填页 (fillOnePageSlot)
 //  11. 占位卡构造 (buildPlaceholderCard)
 //  12. 拿到结果后升级 (fillCardWithResult)
 //  13. canvas 框 + hover-copy (wirePageCanvas)
-//  14. 错误状态 (markCardError)
+//  14. 错误 / 取消状态 (markCardError / markCardCancelled)
 //  15. 框绘制 / 命中测试 (hitTestBox / drawBoxes)
 //  16. 多结果导航 (result-switcher)
 //  17. 清空结果
+// 主动取消链路: §7 按钮 → fetch /api/cancel/{userId} + abortCtl.abort() + pollAbort=true
+//   → 服务端 scheduler.cancel_request(userId) 取消 pending futs
+//   → _cancelled_requests 进 process_batch 两层过滤
+//   → 单图 handler CancelledError → 200 cancelled；PDF task.cancel() → progress.cancelled=true
+//   → 前端 markCardCancelled 标 "已取消" + toast "任务已取消"
 // ============================================================================
 "use strict";
 
@@ -110,7 +115,7 @@ async function pollHealth() {
             aliveVoucher = d.alive_voucher;
             // $("#alive-keeping-id").textContent = aliveVoucher;
             console.log(aliveVoucher);
-            clearInterval(heathLoopID);
+            // clearInterval(heathLoopID);
             const aliveLoopID = setInterval(KeepAlive, 5000);
             await KeepAlive();
         } else {
@@ -230,7 +235,7 @@ function renderQueue() {
         } else {
             thumb = `<img src="${q.fileUrl}" alt="" />`;
         }
-        const statusLabel = {pending: "待处理", processing: "处理中", done: "完成", error: "失败"}[q.status];
+        const statusLabel = {pending: "待处理", processing: "处理中", done: "完成", error: "失败", cancelled: "已取消"}[q.status];
         return `
       <div class="queue-item ${q.status}" data-id="${q.id}">
         ${thumb}
@@ -246,14 +251,51 @@ function renderQueue() {
         : (pending > 0 ? `${pending} 个待处理` : (queue.length > 0 ? `全部 ${queue.length} 个已完成` : ""));
 
     queueEl.querySelectorAll(".remove").forEach(btn => {
-        btn.addEventListener("click", () => {
+        btn.addEventListener("click", (e) => {
+            e.stopPropagation();
             const id = btn.dataset.id;
             const idx = queue.findIndex(q => q.id === id);
-            if (idx >= 0) {
-                if (queue[idx].fileUrl) URL.revokeObjectURL(queue[idx].fileUrl);
-                queue.splice(idx, 1);
+            if (idx < 0) return;
+            const item = queue[idx];
+            console.log("[Wise-Paddle] remove clicked:", id, "status=", item.status, "userId=", item.userId);
+            if (item.status === "processing") {
+                // ===== 主动取消 =====
+                // 1) 通知服务端 cancel（fire-and-forget，scheduler 那边会 cancel futs）
+                if (item.userId) {
+                    fetch(`/api/cancel/${encodeURIComponent(item.userId)}`,
+                        {method: "POST"}).catch((err) => {
+                        console.log("[Wise-Paddle] cancel fetch error:", err);
+                    });
+                }
+                // 2) 中断进行中的 fetch（单图同步路径会立刻抛 AbortError）
+                if (item.abortCtl) item.abortCtl.abort("user cancelled");
+                // 3) 通知 pollPdfProgress 停止轮询（PDF 异步路径）
+                item.pollAbort = true;
+                // 4) UI 立刻置 cancelled —— 不等服务端响应，前端先给反馈
+                item.status = "cancelled";
+                const wallMs = item.t0 ? (performance.now() - item.t0) : 0;
+                if (item.ctl) markCardCancelled(item.ctl, item, wallMs);
+                // 直接修改 queue-item 元素，让用户立即看到变化（不等 renderQueue）
+                const itemEl = btn.closest(".queue-item");
+                if (itemEl) {
+                    itemEl.classList.remove("processing", "pending", "done", "error");
+                    itemEl.classList.add("cancelled");
+                    const badge = itemEl.querySelector(".badge");
+                    if (badge) {
+                        badge.classList.remove("processing", "pending", "done", "error");
+                        badge.classList.add("cancelled");
+                        badge.textContent = "已取消";
+                    }
+                }
+                showToast("任务已取消");
+                // 最后再 renderQueue 同步 queue 数组（不再 splice，所以 item 还在）
                 renderQueue();
+                return;
             }
+            // pending / done / error / cancelled：仅从队列里清掉
+            if (item.fileUrl) URL.revokeObjectURL(item.fileUrl);
+            queue.splice(idx, 1);
+            renderQueue();
         });
     });
 }
@@ -290,12 +332,22 @@ async function processOne(item) {
         user_id: clientUserId,
         voucher_id: aliveVoucher || "",
     });
+    // 3) 在 item 上存取消需要的字段：remove 按钮 handler 要用
+    item.userId = clientUserId;
+    item.ctl = ctl;
+    item.t0 = t0;
+    item.abortCtl = new AbortController();
+    item.pollAbort = false;
+    // 15min 总超时（避免挂死），跟原来的 AbortSignal.timeout 行为一致
+    const timeoutId = setTimeout(() => item.abortCtl.abort("timeout"), 900_000);
     try {
         const fd = new FormData();
         fd.append("file", item.file);
         const r = await fetch(`${url}?${qs.toString()}`,
-            {method: "POST", body: fd, signal: AbortSignal.timeout(900_000)});
+            {method: "POST", body: fd, signal: item.abortCtl.signal});
+        clearTimeout(timeoutId);
         const wallMs = performance.now() - t0;
+        // 主动取消时 fetch 抛 AbortError —— 走到 catch 分支，由 catch 区分"主动取消"vs"真错误"
         if (!r.ok) {
             const err = await r.json().catch(() => ({}));
             item.status = "error";
@@ -319,6 +371,10 @@ async function processOne(item) {
             fillCardWithResult(ctl, item, data, wallMs);
         }
     } catch (e) {
+        clearTimeout(timeoutId);
+        // 主动取消时 fetch 抛 AbortError，但 item.status 可能已经被 remove handler
+        // 置为 "cancelled" —— 这种情况不要再覆盖成 error
+        if (item.status === "cancelled" || item.pollAbort) return;
         item.status = "error";
         renderQueue();
         markCardError(ctl, String(e), performance.now() - t0);
@@ -350,6 +406,8 @@ async function pollPdfProgress(ctl, item, userId, initData, t0) {
     if (status) status.textContent = "处理中";
 
     const tick = async () => {
+        // 主动取消：用户点了 remove 按钮，停止轮询
+        if (item.pollAbort) return;
         try {
             const r = await fetch(pollUrl, {cache: "no-store"});
             if (!r.ok) {
@@ -384,24 +442,33 @@ async function pollPdfProgress(ctl, item, userId, initData, t0) {
 
             if (data.done || data.cancelled || data.error) {
                 const wallMs = performance.now() - t0;
-                item.status = (data.cancelled || data.error) ? "error" : "done";
+                if (data.cancelled) {
+                    item.status = "cancelled";
+                } else if (data.error) {
+                    item.status = "error";
+                } else {
+                    item.status = "done";
+                }
                 renderQueue();
                 if (data.error) {
                     markCardError(ctl, data.error, wallMs);
                 } else if (data.cancelled) {
-                    markCardError(ctl, "服务端取消", wallMs);
+                    // 服务端取消（voucher 倒计时归零等）：跟前端主动 cancel 同一套 UI
+                    markCardCancelled(ctl, item, wallMs);
                 }
                 // 切所有未完成 page-slot 状态
                 for (let i = 0; i < ctl.totalPages; i++) {
                     if (!filledPages.has(i)) {
                         if (ctl.pageSlots[i]) {
-                            ctl.pageSlots[i].dataset.status = (data.cancelled || data.error) ? "error" : "waiting";
+                            ctl.pageSlots[i].dataset.status = data.cancelled ? "cancelled" :
+                                (data.error ? "error" : "waiting");
                         }
                         if (ctl.chips) {
                             const chip = ctl.chips.querySelector(`.page-chip[data-page-index="${i}"]`);
                             if (chip) {
                                 chip.classList.remove("processing");
-                                if (data.cancelled || data.error) chip.classList.add("error");
+                                if (data.cancelled) chip.classList.add("cancelled");
+                                else if (data.error) chip.classList.add("error");
                             }
                         }
                     }
@@ -409,10 +476,13 @@ async function pollPdfProgress(ctl, item, userId, initData, t0) {
                 // timing 更新
                 const big = ctl.head.querySelector('[data-role="server"]');
                 if (big) {
-                    big.classList.remove("processing");
-                    if (data.cancelled || data.error) {
+                    big.classList.remove("processing", "error", "cancelled");
+                    if (data.cancelled) {
+                        big.classList.add("cancelled");
+                        big.textContent = "取消";
+                    } else if (data.error) {
                         big.classList.add("error");
-                        big.textContent = data.cancelled ? "取消" : "失败";
+                        big.textContent = "失败";
                     } else {
                         big.innerHTML = `${(wallMs / 1000).toFixed(2)}<span style="font-size:14px;color:var(--fg-dim);">s</span>`;
                     }
@@ -475,7 +545,7 @@ function fillOnePageSlot(ctl, item, pageIndex, pageData) {
             <span class="r-score">${(r.score * 100).toFixed(1)}% · #${j}</span>
           </div>
           <div class="r-text">${escapeHtml(r.markdown || "")}</div>
-          <div class="r-hint">悬停框即复制</div>
+<!--          <div class="r-hint">悬停框即复制</div>-->
         </div>`).join("");
         }
     }
@@ -711,7 +781,7 @@ function fillCardWithResult(ctl, item, data, wallMs) {
               <span class="r-score">${(r.score * 100).toFixed(1)}% · #${j}</span>
             </div>
             <div class="r-text">${escapeHtml(r.markdown || "")}</div>
-            <div class="r-hint">悬停框即复制</div>
+<!--            <div class="r-hint">悬停框即复制</div>-->
           </div>`).join("");
             }
         }
@@ -850,6 +920,32 @@ function markCardError(ctl, msg, wallMs) {
     ctl.card.appendChild(errBar);
 }
 
+function markCardCancelled(ctl, item, wallMs) {
+    // 跟 markCardError 同构，但不带错误条，big timing 文字是"取消"
+    ctl.card.dataset.status = "cancelled";
+    updateResultTab(ctl.seq, "cancelled");
+    const status = ctl.head.querySelector('[data-role="status"]');
+    if (status) status.textContent = "已取消";
+    const big = ctl.head.querySelector('[data-role="server"]');
+    if (big) {
+        big.classList.remove("processing", "error");
+        big.classList.add("cancelled");
+        big.textContent = "取消";
+    }
+    const wallEl = ctl.head.querySelector('[data-role="wall"]');
+    if (wallEl) wallEl.textContent = `${(wallMs / 1000).toFixed(2)}s`;
+    ctl.pageSlots.forEach((slot, i) => {
+        slot.dataset.status = "cancelled";
+        if (ctl.chips) {
+            const chip = ctl.chips.querySelector(`.page-chip[data-page-index="${i}"]`);
+            if (chip) {
+                chip.classList.remove("processing", "done", "error");
+                chip.classList.add("cancelled");
+            }
+        }
+    });
+}
+
 function hitTestBox(e, canvas, regionData, srcW, srcH) {
     const r = canvas.getBoundingClientRect();
     const sx = r.width / srcW, sy = r.height / srcH;
@@ -927,7 +1023,7 @@ function addResultTab(seq, item) {
     } else if (item.fileUrl) {
         thumbSrc = item.fileUrl;
     }
-    const statusText = {pending: "待处理", processing: "处理中", done: "完成", error: "失败"}[item.status] || "处理中";
+    const statusText = {pending: "待处理", processing: "处理中", done: "完成", error: "失败", cancelled: "已取消"}[item.status] || "处理中";
     tab.innerHTML = `
     ${thumbSrc ? `<img class="rs-tab-thumb" src="${escapeAttr(thumbSrc)}" alt="" />` : `<div class="rs-tab-thumb" style="display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--fg-dim);">${item.isPdf ? "PDF" : "IMG"}</div>`}
     <div class="rs-tab-text">
@@ -950,9 +1046,9 @@ function updateResultTab(seq, status) {
     if (!tab) return;
     const statusEl = tab.querySelector(".rs-tab-status");
     if (statusEl) {
-        statusEl.classList.remove("processing", "done", "error");
+        statusEl.classList.remove("processing", "done", "error", "cancelled");
         statusEl.classList.add(status);
-        statusEl.textContent = {processing: "处理中", done: "完成", error: "失败"}[status] || status;
+        statusEl.textContent = {processing: "处理中", done: "完成", error: "失败", cancelled: "已取消"}[status] || status;
     }
 }
 
