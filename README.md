@@ -82,7 +82,8 @@ python app.py
 | `POST` | `/ocr/base64` | 上传图片（base64 JSON），返回 OCR 结果 |
 | `POST` | `/ocr/pdf` | 上传 PDF，异步处理，返回 user_id + 轮询 URL |
 | `GET` | `/api/ocr/pdf-status/{uid}` | 轮询 PDF 处理进度 |
-| `POST` | `/api/release` | 主动释放用户资源（前端关闭页面时调用） |
+| `POST` | `/api/cancel/{user_id}` | 取消某次 upload 的所有 pending + in-flight 任务 |
+| `POST` | `/alive` | 前端心跳，刷新 voucher 保活倒计时 |
 
 ### 单图 OCR 示例
 
@@ -145,15 +146,15 @@ curl -X POST http://127.0.0.1:8000/ocr/pdf \
 curl http://127.0.0.1:8000/api/ocr/pdf-status/xyz789
 ```
 
-### 释放资源
+### 取消任务
 
-前端在 `pagehide` / `beforeunload` 时通过 `sendBeacon` 调用：
+前端点击"移除"或页面关闭时，通过 `sendBeacon` / `fetch` 调用：
 
 ```bash
-curl -X POST http://127.0.0.1:8000/api/release \
-  -H "Content-Type: application/json" \
-  -d '{"user_id": "abc123"}'
+curl -X POST http://127.0.0.1:8000/api/cancel/abc123
 ```
+
+服务端会取消该 `user_id` 的所有 pending + in-flight 工作（单图同步响应返回 `status=cancelled`，PDF 进度标记 `cancelled=true`）。会话级保活由 `/alive` 心跳维护，超时后服务端按 voucher 自动清理整批任务。
 
 ## 二次开发指南
 
@@ -303,7 +304,7 @@ def _take_priority_batch(self, max_n: int) -> list[Job]:
 - **RoPE 兼容性**：`core_pipeline.py` 启动时自动 patch `transformers.modeling_rope_utils.ROPE_INIT_FUNCTIONS["default"]`，确保 transformers 5.x 与老模型兼容。如升级 transformers 版本后出现加载异常，请检查此 patch 是否生效。
 - **VL 模型加载**：必须使用 `AutoModelForImageTextToText`（而非 `AutoModelForCausalLM`），否则模型无法看到图像输入，会纯靠文本编造。
 - **Left Padding**：VL 推理 batch 模式需要 left-padding（`tokenizer.padding_side = "left"`），代码已自动设置，请勿覆盖。
-- **资源释放**：前端必须在 `pagehide` / `beforeunload` 时调用 `/api/release`，否则用户的 pending job 会持续占用调度队列。
+- **资源释放**：前端通过 `/alive` 心跳保活，voucher 倒计时归零后服务端自动取消该会话全部任务；手动取消走 `/api/cancel/{user_id}`。后台标签页会被浏览器节流，请保持 `ALIVE_INITIAL_TTL` 足够大（默认 120）。
 
 ## 许可证
 

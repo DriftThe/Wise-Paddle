@@ -1,7 +1,7 @@
 # Wise-Paddle 代码执行流详解
 
 > ⚠️ **STALE — 这是 v0.4.0 的快照（重构前 baseline）**
-> v0.5.0 已经把 `demo.py` 落地到 `app.py`、彻底删除了心跳机制（`/api/heartbeat`、`_user_heartbeat`、`_cleanup_loop`、`HEARTBEAT_TIMEOUT_S` 全部移除，改为前端 `pagehide` 显式 `sendBeacon /api/release` + 服务端 `CancelledError` 兜底），并把所有可调参数重构为 `.env` 驱动。
+> 当前代码（v0.6.0）与本文差异较大：心跳已改为 `/alive` voucher 机制（`_kick_dead_user_loop` + `scheduler.cancel_voucher`），主动取消走 `/api/cancel/{user_id}`，`/api/heartbeat`、`/api/release` 均已不存在；所有可调参数为 `.env` 驱动。
 > **本文档仅作历史参考**。当前代码以 `app.py` / `core_pipeline.py` / `README.md` / `.env.example` 为准。
 
 > **历史版本（v0.4.0）**：`core_pipeline.py` (1102 行) / `demo.py` (878 行) / `static/index.html` (~52KB)
