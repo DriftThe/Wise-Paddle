@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -101,6 +102,10 @@ _patch_rope_default()
 _CANCELLED_TRACK_SOFT_LIMIT = 4096
 # _unique_path 重名时最多尝试次数，避免死循环。
 _UNIQUE_PATH_MAX_ATTEMPTS = 10_000
+# 用户书签闲置多久后清理（_user_order / _user_completed 防泄漏）
+_USER_IDLE_PRUNE_S = 600.0
+# 合法 request_id 白名单（与 app.py 的 _sanitize_user_id 同口径，纵深防御）
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -217,7 +222,7 @@ class LayoutDetector:
         scale = self._max_long_side / m
         return image.resize(
             (max(1, int(w * scale)), max(1, int(h * scale))),
-            Image.BILINEAR,
+            Image.Resampling.BILINEAR,
         )
 
     @torch.no_grad()
@@ -369,23 +374,21 @@ class BoxFilter:
 class RegionCropper:
     """用 numpy 把 LayoutBox 对应的区域切出来，返回 RGB ``np.ndarray``。"""
 
-    def crop(self, image: Image.Image, box: LayoutBox) -> np.ndarray:
-        """Crop ``box`` from ``image`` and return RGB ``(H, W, 3)`` uint8 array.
+    def crop(self, rgb: np.ndarray, box: LayoutBox) -> np.ndarray:
+        """Crop ``box`` from an RGB ``(H, W, 3)`` uint8 array.
 
         Returns a 1×1 black placeholder if the clamped box collapses to empty.
         """
-        # PIL 转 RGB numpy (H, W, 3) uint8
-        arr = np.asarray(image.convert("RGB"))
         x1, y1, x2, y2 = box.int_rect
         # clamp 到合法范围
-        h, w = arr.shape[:2]
+        h, w = rgb.shape[:2]
         x1 = max(0, min(x1, w))
         x2 = max(0, min(x2, w))
         y1 = max(0, min(y1, h))
         y2 = max(0, min(y2, h))
         if x2 <= x1 or y2 <= y1:
             return np.zeros((1, 1, 3), dtype=np.uint8)
-        return arr[y1:y2, x1:x2].copy()
+        return rgb[y1:y2, x1:x2].copy()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -632,6 +635,16 @@ class OCRPipeline:
         """每次处理前都确认根目录在（外部可能 mavis-trash 掉）。"""
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    def _safe_request_dir(self, request_id: str) -> Path:
+        """构造 request 输出目录并做防穿越校验（H-01 纵深防御）。"""
+        if not _REQUEST_ID_RE.fullmatch(request_id or ""):
+            raise ValueError(f"illegal request_id: {request_id!r}")
+        base = self.output_dir.resolve()
+        req_dir = (base / request_id).resolve()
+        if not req_dir.is_relative_to(base):
+            raise ValueError(f"request_id escapes output dir: {request_id!r}")
+        return req_dir
+
     @staticmethod
     def _unique_path(path: Path) -> Path:
         """Return ``path`` if it doesn't exist, else append ``_1``, ``_2`` …
@@ -672,8 +685,10 @@ class OCRPipeline:
             layouts, page_size=(image.width, image.height)
         )[: self.max_regions]
         crops: list[tuple[Image.Image, LayoutBox]] = []
+        # 每页只做一次 RGB 转换（L-10）
+        rgb = np.asarray(image.convert("RGB"))
         for box in kept:
-            arr = self.cropper.crop(image, box)
+            arr = self.cropper.crop(rgb, box)
             if arr.size == 0 or arr.shape[0] < 2 or arr.shape[1] < 2:
                 continue
             crops.append((Image.fromarray(arr), box))
@@ -697,7 +712,12 @@ class OCRPipeline:
         regions: list[RegionResult] = []
         for c_idx, (img, box) in enumerate(crops):
             md = md_lookup.get((page_offset, c_idx), "")
-            md_path = req_dir / f"page_{page_index}_box_{box.label_id}_{box.label_name}.md"
+            # label 消毒 + uuid 短后缀，避免特殊字符与并发写同名竞态（L-03 / M-07）
+            safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", box.label_name).strip("_") or "box"
+            md_path = req_dir / (
+                f"page_{page_index}_box_{box.label_id}_{safe_label}"
+                f"_{uuid.uuid4().hex[:8]}.md"
+            )
             md_path = OCRPipeline._unique_path(md_path)
             md_path.write_text(md, encoding="utf-8")
             regions.append(
@@ -741,7 +761,7 @@ class OCRPipeline:
         # request_id 隔离不同请求的输出，避免并发 path 冲突
         if request_id is None:
             request_id = uuid.uuid4().hex[:8]
-        req_dir = self.output_dir / request_id
+        req_dir = self._safe_request_dir(request_id)
         regions = self._write_regions(req_dir, page_index, crops, md_lookup, 0)
 
         return PageResult(
@@ -791,10 +811,13 @@ class OCRPipeline:
         st = time.perf_counter()
         self._ensure_output_dir()
 
-        # 防御：request_id 缺失会写到 output_dir 根目录，污染文件
+        # 防御：request_id 缺失 / 非法会写到 output_dir 根目录或越界，污染文件
         for j in jobs:
-            if not j.request_id:
-                raise ValueError("Job.request_id must be set; got empty/None")
+            if not _REQUEST_ID_RE.fullmatch(j.request_id or ""):
+                raise ValueError(
+                    f"Job.request_id must be 1-64 chars of [A-Za-z0-9_-]; "
+                    f"got {j.request_id!r}"
+                )
 
         n = len(jobs)
 
@@ -847,7 +870,7 @@ class OCRPipeline:
         active2_results: list[PageResult] = []
         for p_idx, (job, crops) in enumerate(zip(active2_jobs, crops2_per_page)):
             image = images2_rgb[p_idx]
-            req_dir = self.output_dir / job.request_id
+            req_dir = self._safe_request_dir(job.request_id)
             regions = self._write_regions(
                 req_dir, job.page_index, crops, md_lookup, p_idx
             )
@@ -856,7 +879,7 @@ class OCRPipeline:
                     page_index=job.page_index,
                     width=image.width,
                     height=image.height,
-                    elapsed_seconds=time.perf_counter() - st,  # 整批 wall time
+                    elapsed_seconds=time.perf_counter() - st,  # 本页完成时刻的墙钟耗时（L-09）
                     regions=regions,
                 )
             )
@@ -991,6 +1014,7 @@ class BatchScheduler:
         self._user_pending: dict[str, "collections.deque[Job]"] = {}
         self._user_order: list[str] = []  # user 首次出现顺序（断 ties）
         self._user_completed: dict[str, int] = {}
+        self._user_last_active: dict[str, float] = {}  # 单调钟最近活动时间，用于闲置清理
         self._pending_count = 0
         self._lock = asyncio.Lock()
         self._wakeup = asyncio.Event()
@@ -1062,6 +1086,7 @@ class BatchScheduler:
             self._user_pending[request_id] = collections.deque()
             self._user_order.append(request_id)
         self._user_pending[request_id].append(job)
+        self._user_last_active[request_id] = time.monotonic()
         self._pending_count += 1
         self._wakeup.set()
         return job
@@ -1167,6 +1192,24 @@ class BatchScheduler:
             self._pending_count = max(0, self._pending_count - cancelled_count)
         return cancelled_count
 
+    def _prune_idle_users(self, now: float) -> None:
+        """清理闲置用户书签，防止 _user_order / _user_completed 无限增长（H-05）。
+
+        调用者必须持有 ``self._lock``。仅清理"队列已空 + 超过空闲窗口"的用户；
+        有 pending 或刚活动过的用户不受影响。
+        """
+        for u in list(self._user_pending.keys()):
+            if self._user_pending[u]:
+                continue
+            last = self._user_last_active.get(u)
+            if last is not None and now - last > _USER_IDLE_PRUNE_S:
+                del self._user_pending[u]
+                self._user_completed.pop(u, None)
+                self._user_last_active.pop(u, None)
+                if u in self._user_order:
+                    self._user_order.remove(u)
+                logger.info("scheduler pruned idle user=%s", u)
+
     def _maybe_gc_cancelled_tracking(self) -> None:
         """Soft-GC cancelled tracking sets when they grow too large.
 
@@ -1186,7 +1229,6 @@ class BatchScheduler:
         # Conservative GC: only drop cancelled entries whose user_id is no longer
         # active (not in _user_pending and not recently completed).
         active_users = set(self._user_pending.keys()) | set(self._user_completed.keys())
-        before_v = len(self._cancelled_vouchers)
         before_r = len(self._cancelled_requests)
         # We can only safely drop request-level cancellations for users no
         # longer active. Voucher-level cancellations are kept as-is (they may
@@ -1194,13 +1236,12 @@ class BatchScheduler:
         self._cancelled_requests = {
             r for r in self._cancelled_requests if r in active_users
         }
-        gc_v = before_v - len(self._cancelled_vouchers)
         gc_r = before_r - len(self._cancelled_requests)
-        if gc_v or gc_r:
+        if gc_r:
             logger.info(
-                "scheduler GC: removed %d voucher(s) and %d request(s) from "
-                "cancelled tracking sets",
-                gc_v, gc_r,
+                "scheduler GC: removed %d request(s) from cancelled tracking "
+                "sets (vouchers retained by design)",
+                gc_r,
             )
 
     async def _cancel_all_pending(self, reason: str) -> None:
@@ -1236,6 +1277,8 @@ class BatchScheduler:
 
         调用者必须持有 ``self._lock``。
         """
+        # 顺带清理闲置用户书签，防 _user_order/_user_completed 无限增长（H-05）
+        self._prune_idle_users(time.monotonic())
         if not self._user_pending or max_n <= 0:
             return []
 
@@ -1382,6 +1425,9 @@ class BatchScheduler:
         # 5) 更新每个 user 的已完成数（用于下次 fair 排序）
         for u, c in user_in_batch_count.items():
             self._user_completed[u] = self._user_completed.get(u, 0) + c
+        now = time.monotonic()
+        for u in user_in_batch_count:
+            self._user_last_active[u] = now
         # 6) 分发结果
         for job, page in zip(batch, results or []):
             if not job.fut.done():

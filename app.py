@@ -49,11 +49,11 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageOps
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -106,7 +106,10 @@ class Config:
     # ---- HTTP server ----
     host: str = _env_str("HOST", "127.0.0.1")
     port: int = _env_int("PORT", 8000)
-    cors_allow_origins: list[str] = None  # type: ignore  # set in __post_init__
+    cors_allow_origin_regex: str = _env_str(
+        "CORS_ALLOW_ORIGIN_REGEX",
+        r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    )
     graceful_shutdown_s: int = _env_int("GRACEFUL_SHUTDOWN_S", 15)
 
     # ---- 模型路径 ----
@@ -149,6 +152,7 @@ class Config:
     max_image_upload_mb: float = _env_float("MAX_IMAGE_UPLOAD_MB", 32.0)
     max_pdf_upload_mb: float = _env_float("MAX_PDF_UPLOAD_MB", 128.0)
     max_pdf_pages: int = _env_int("MAX_PDF_PAGES", 200)
+    max_image_pixels: int = _env_int("MAX_IMAGE_PIXELS", 50_000_000)  # 解码后单图像素上限
     pdf_dpi: float = _env_float("PDF_DPI", 200.0)
 
     # ---- 日志 ----
@@ -162,14 +166,10 @@ class Config:
     cleanup_interval_s: int = _env_int("CLEANUP_INTERVAL_S", 300)  # 5min 扫一次
 
     # ---- 心跳 ----
-    alive_tick_seconds: float = _env_float("ALIVE_TICK_SECONDS", 1.0)  # KickDeadUser 扫描周期
-    alive_initial_ttl: int = _env_int("ALIVE_INITIAL_TTL", 7)  # 每次 /alive 把 TTL 重置到这个值
+    alive_tick_seconds: float = _env_float("ALIVE_TICK_SECONDS", 2.0)  # KickDeadUser 扫描周期
+    alive_initial_ttl: int = _env_int("ALIVE_INITIAL_TTL", 120)  # 每次 /alive 把 TTL 重置到这个值（秒数=ttl×tick）
 
     def __post_init__(self) -> None:
-        if self.cors_allow_origins is None:
-            self.cors_allow_origins = _env_str(
-                "CORS_ALLOW_ORIGINS", "http://localhost:*,http://127.0.0.1:*"
-            ).split(",")
         if self.output_dir is None:
             self.output_dir = Path(_env_str("OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR)))
         if self.log_dir is None:
@@ -279,7 +279,7 @@ _pdf_progress_lock = asyncio.Lock()
 _pdf_cleanup_task: Optional[asyncio.Task] = None
 _text_result_cleanup_task: Optional[asyncio.Task] = None
 _alive_check_task: Optional[asyncio.Task] = None
-_app_version = "0.5.0"
+_app_version = "0.6.0"
 
 # ─── 心跳：aliveUsers 由 _alive_lock 保护 ─────────────────────────
 # voucher -> 剩余 tick 数。每次 /alive 把 TTL 重置到 CFG.alive_initial_ttl；
@@ -454,7 +454,7 @@ app = FastAPI(title="Wise-Paddle Service", version=_app_version, lifespan=lifesp
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CFG.cors_allow_origins,
+    allow_origin_regex=CFG.cors_allow_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -471,7 +471,7 @@ async def _unhandled_exc_handler(request: Request, exc: Exception) -> JSONRespon
     logger.exception("UNHANDLED: %s %s", request.method, request.url.path)
     return JSONResponse(
         status_code=500,
-        content={"detail": f"internal error: {type(exc).__name__}: {exc}"},
+        content={"detail": "internal server error"},
     )
 
 
@@ -542,6 +542,38 @@ def _check_content_length(request: Request, max_mb: float) -> None:
             )
 
 
+_USER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _sanitize_user_id(value: Optional[str]) -> str:
+    """校验 / 生成用户侧 request_id，拒绝路径穿越等非法字符（H-01 / M-04）。"""
+    if value is None or value == "":
+        return uuid.uuid4().hex[:8]
+    if not _USER_ID_RE.fullmatch(value):
+        raise HTTPException(
+            status_code=400,
+            detail="user_id 只允许字母 / 数字 / 下划线 / 连字符（1-64 字符）",
+        )
+    return value
+
+
+def _safe_filename(name: Optional[str]) -> str:
+    """日志安全：转义文件名中的控制字符，防日志注入（L-05）。"""
+    name = name or "<unnamed>"
+    return name.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+
+def _check_pixel_budget(width: int, height: int) -> None:
+    """解码后像素预算检查，防解压炸弹（H-03）。"""
+    if width <= 0 or height <= 0:
+        raise HTTPException(status_code=400, detail="图片尺寸无效")
+    if width * height > CFG.max_image_pixels:
+        raise HTTPException(
+            status_code=413,
+            detail=f"图片像素数超过 {CFG.max_image_pixels // 1_000_000}MP 限制",
+        )
+
+
 def _strip_data_uri(payload: str) -> str:
     """Strip the ``data:...;base64,`` prefix if present, return the raw b64 body."""
     if not payload.startswith("data:"):
@@ -552,15 +584,34 @@ def _strip_data_uri(payload: str) -> str:
     return payload[comma_idx + 1:]
 
 
+def _decode_raw_image(raw: bytes) -> np.ndarray:
+    """把图片字节解码为 RGB ndarray，优先走 PIL 以处理 EXIF 方向（L-13），失败回退 cv2。"""
+    try:
+        with PILImage.open(io.BytesIO(raw)) as pil_img:
+            transposed = ImageOps.exif_transpose(pil_img)
+            transposed.load()
+        return np.asarray(transposed.convert("RGB"))
+    except Exception:
+        arr = np.frombuffer(raw, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("无法解码图片")
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
 def _decode_b64_to_rgb(payload: str) -> np.ndarray:
     """Decode a base64 image payload (optionally data-URI prefixed) to RGB ndarray."""
     b64 = _strip_data_uri(payload)
-    raw = base64.b64decode(b64)
-    arr = np.frombuffer(raw, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("无法将 base64 解码为图片")
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    # base64 文本长度上限 ≈ 原始字节上限 × 4/3，额外留一点余量
+    if len(b64) > CFG.max_image_upload_mb * 1.5 * 1024 * 1024:
+        raise ValueError(f"base64 载荷超过 {CFG.max_image_upload_mb:.0f}MB 限制")
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception as e:
+        raise ValueError("base64 解码失败") from e
+    rgb = _decode_raw_image(raw)
+    _check_pixel_budget(rgb.shape[1], rgb.shape[0])
+    return rgb
 
 
 def _rgb_to_pil(rgb: np.ndarray) -> PILImage.Image:
@@ -576,7 +627,27 @@ def _pil_to_b64_png(pil_img: PILImage.Image) -> str:
     return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _decode_pdf_to_pil_pages(raw: bytes, dpi: float = 200.0) -> list[PILImage.Image]:
+def _count_pdf_pages(raw: bytes) -> int:
+    """只打开 PDF 元数据，返回页数；加密 PDF 抛 ValueError（H-02 / L-12）。"""
+    import pymupdf
+
+    if raw[:4] != b"%PDF":
+        raise ValueError("不是合法 PDF 文件")
+    try:
+        pdf = pymupdf.open(stream=raw, filetype="pdf")
+    except Exception as e:
+        raise ValueError("无法解析 PDF 文件") from e
+    try:
+        if pdf.needs_pass:
+            raise ValueError("PDF 已加密，需要密码才能打开")
+        return len(pdf)
+    finally:
+        pdf.close()
+
+
+def _decode_pdf_to_pil_pages(
+        raw: bytes, dpi: float = 200.0, max_pixels: int | None = None,
+) -> list[PILImage.Image]:
     """PDF bytes → list[PIL.Image]，每页一张 RGB 图。in-memory，不落盘。"""
     import pymupdf
 
@@ -587,9 +658,15 @@ def _decode_pdf_to_pil_pages(raw: bytes, dpi: float = 200.0) -> list[PILImage.Im
     pages: list[PILImage.Image] = []
     pdf = pymupdf.open(stream=raw, filetype="pdf")
     try:
+        if pdf.needs_pass:
+            raise ValueError("PDF 已加密，需要密码才能打开")
         for page_num in range(len(pdf)):
             page = pdf[page_num]
             pix = page.get_pixmap(matrix=mat, alpha=False)
+            if max_pixels is not None and pix.width * pix.height > max_pixels:
+                raise ValueError(
+                    f"PDF 第 {page_num + 1} 页像素数超过上限"
+                )
             img = PILImage.frombytes("RGB", (pix.width, pix.height), pix.samples)
             pages.append(img)
     finally:
@@ -668,7 +745,7 @@ async def _process_pages(
         raise  # 让 handler 决定如何返回 200+cancelled
 
 
-def _build_ocr_response_with_images(
+async def _build_ocr_response_with_images(
         request_id: str,
         pil_pages: list[PILImage.Image],
         page_results: list,
@@ -679,7 +756,8 @@ def _build_ocr_response_with_images(
     all_regions: list[OCRRegion] = []
     out_pages: list[OCRPage] = []
     for pil, pr in zip(pil_pages, page_results):
-        b64 = _pil_to_b64_png(pil)
+        # PNG 编码是 CPU 密集操作，放线程池避免阻塞事件循环（M-02）
+        b64 = await run_in_threadpool(_pil_to_b64_png, pil)
         out_pages.append(
             OCRPage(
                 page_index=pr.page_index,
@@ -738,18 +816,18 @@ async def ocr_upload(request: Request, file: UploadFile = File(...)):
         raise HTTPException(
             status_code=413, detail=f"图片超过 {CFG.max_image_upload_mb:.0f}MB 限制"
         )
-    arr = np.frombuffer(raw, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise HTTPException(status_code=400, detail="无法解码上传的图片")
-    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    try:
+        rgb = _decode_raw_image(raw)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    _check_pixel_budget(rgb.shape[1], rgb.shape[0])
     pil = _rgb_to_pil(rgb)
 
-    request_id = request.query_params.get("user_id") or uuid.uuid4().hex[:8]
+    request_id = _sanitize_user_id(request.query_params.get("user_id"))
     voucher_id = request.query_params.get("voucher_id") or ""
     logger.info(
         "UPLOAD: user=%s voucher=%s endpoint=/ocr/upload file=%s size=%d bytes mime=%s",
-        request_id, voucher_id, file.filename or "<unnamed>", len(raw), file.content_type or "?",
+        request_id, voucher_id, _safe_filename(file.filename), len(raw), file.content_type or "?",
     )
     st = time.perf_counter()
     try:
@@ -775,7 +853,7 @@ async def ocr_upload(request: Request, file: UploadFile = File(...)):
         "COMPLETE: user=%s voucher=%s endpoint=/ocr/upload pages=1 regions=%d elapsed=%.2fs queue_wait=%.2fs",
         request_id, voucher_id, n_regions, elapsed, queue_wait,
     )
-    return _build_ocr_response_with_images(
+    return await _build_ocr_response_with_images(
         request_id, [pil], page_results, elapsed, queue_wait,
         voucher_id=voucher_id,
     )
@@ -789,7 +867,7 @@ async def ocr_base64(req: Base64Request, request: Request):
         raise HTTPException(status_code=400, detail=str(e))
     pil = _rgb_to_pil(rgb)
 
-    request_id = request.query_params.get("user_id") or uuid.uuid4().hex[:8]
+    request_id = _sanitize_user_id(request.query_params.get("user_id"))
     voucher_id = request.query_params.get("voucher_id") or ""
     logger.info(
         "UPLOAD: user=%s voucher=%s endpoint=/ocr/base64 size=%d bytes (decoded=%dx%d)",
@@ -818,7 +896,7 @@ async def ocr_base64(req: Base64Request, request: Request):
         "COMPLETE: user=%s voucher=%s endpoint=/ocr/base64 pages=1 regions=%d elapsed=%.2fs queue_wait=%.2fs",
         request_id, voucher_id, n_regions, elapsed, queue_wait,
     )
-    return _build_ocr_response_with_images(
+    return await _build_ocr_response_with_images(
         request_id, [pil], page_results, elapsed, queue_wait,
         voucher_id=voucher_id,
     )
@@ -871,9 +949,11 @@ async def _run_pdf_batch(
                         )
                         # 继续等剩余的（可能也有 cancelled），不 break
                         continue
-                    page_dict = _make_pdf_page_dict(page_result, pil_pages[page_idx])
+                    page_dict = await _make_pdf_page_dict(page_result, pil_pages[page_idx])
                     progress["pages"][page_idx] = page_dict
                     progress["done_count"] = len(progress["pages"])
+                    # 编码完成后释放该页原图，避免进度 store 内 PIL + base64 双重持有（M-13）
+                    progress["pil_pages"][page_idx] = None
                 except asyncio.CancelledError:
                     progress["cancelled"] = True
                     for j in jobs:
@@ -923,13 +1003,14 @@ async def _run_pdf_batch(
         )
 
 
-def _make_pdf_page_dict(page_result: Any, pil_page: PILImage.Image) -> dict:
+async def _make_pdf_page_dict(page_result: Any, pil_page: PILImage.Image) -> dict:
     """Build the JSON-serializable page dict returned by the PDF status endpoint."""
+    image_b64 = await run_in_threadpool(_pil_to_b64_png, pil_page)
     return {
         "page_index": page_result.page_index,
         "width": page_result.width,
         "height": page_result.height,
-        "image_b64": _pil_to_b64_png(pil_page),
+        "image_b64": image_b64,
         "regions": [
             {
                 "page_index": page_result.page_index,
@@ -979,27 +1060,41 @@ async def ocr_pdf(request: Request, file: UploadFile = File(...)):
     if raw[:4] != b"%PDF":
         raise HTTPException(status_code=400, detail="不是合法 PDF 文件")
 
+    # 先读元数据（页数 / 加密状态），再决定是否完整光栅化（H-02 / L-12）
     try:
-        pil_pages = await run_in_threadpool(_decode_pdf_to_pil_pages, raw, CFG.pdf_dpi)
+        page_count = await run_in_threadpool(_count_pdf_pages, raw)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("PDF open failed")
+        raise HTTPException(status_code=500, detail="PDF 解析失败")
+
+    if page_count <= 0:
+        raise HTTPException(status_code=400, detail="PDF 没有页面")
+    if page_count > CFG.max_pdf_pages:
+        raise HTTPException(
+            status_code=413,
+            detail=f"PDF 页数 {page_count} 超过 {CFG.max_pdf_pages} 页上限",
+        )
+
+    try:
+        pil_pages = await run_in_threadpool(
+            _decode_pdf_to_pil_pages, raw, CFG.pdf_dpi, CFG.max_image_pixels,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.exception("PDF decode failed")
-        raise HTTPException(status_code=500, detail=f"PDF 解析失败: {e}")
+        raise HTTPException(status_code=500, detail="PDF 解析失败")
 
     if not pil_pages:
         raise HTTPException(status_code=400, detail="PDF 没有页面")
-    if len(pil_pages) > CFG.max_pdf_pages:
-        raise HTTPException(
-            status_code=413,
-            detail=f"PDF 页数 {len(pil_pages)} 超过 {CFG.max_pdf_pages} 页上限",
-        )
 
-    user_id = request.query_params.get("user_id") or uuid.uuid4().hex[:8]
+    user_id = _sanitize_user_id(request.query_params.get("user_id"))
     voucher_id = request.query_params.get("voucher_id") or ""
     logger.info(
         "UPLOAD: user=%s voucher=%s endpoint=/ocr/pdf file=%s size=%d bytes pages=%d dpi=%.0f",
-        user_id, voucher_id, file.filename or "<unnamed>", len(raw), len(pil_pages), CFG.pdf_dpi,
+        user_id, voucher_id, _safe_filename(file.filename), len(raw), len(pil_pages), CFG.pdf_dpi,
     )
 
     async with _pdf_progress_lock:
@@ -1039,7 +1134,8 @@ async def ocr_pdf(request: Request, file: UploadFile = File(...)):
 
 
 @app.get("/api/ocr/pdf-status/{user_id}")
-async def pdf_status(user_id: str):
+async def pdf_status(user_id: str, since: int = Query(default=0, ge=0)):
+    user_id = _sanitize_user_id(user_id)
     progress = _pdf_progress_store.get(user_id)
     if not progress:
         return JSONResponse(
@@ -1054,6 +1150,10 @@ async def pdf_status(user_id: str):
                 "pages": {},
             },
         )
+    pages = dict(progress["pages"])
+    if since > 0:
+        # 增量返回：只回传 >= since 的已完成页，降低轮询带宽（M-12）
+        pages = {k: v for k, v in pages.items() if int(k) >= since}
     return JSONResponse(
         status_code=200,
         content={
@@ -1064,7 +1164,7 @@ async def pdf_status(user_id: str):
             "done_count": progress["done_count"],
             "cancelled": progress.get("cancelled", False),
             "error": progress.get("error"),
-            "pages": dict(progress["pages"]),
+            "pages": pages,
         },
     )
 
@@ -1089,6 +1189,7 @@ async def cancel_user_request(user_id: str):
     3. 单图同步响应路径：handler 仍在 ``await asyncio.gather``，``fut.cancel()`` 后
        gather 会抛 CancelledError，handler 返回 200 cancelled
     """
+    user_id = _sanitize_user_id(user_id)
     if scheduler is None:
         raise HTTPException(status_code=503, detail="Scheduler 尚未初始化")
 
@@ -1128,6 +1229,8 @@ async def alive_user_pend(request: AliveRequest):
     语义等价，统一处理）。
     """
     voucher = request.aliveVoucher
+    if not voucher:
+        raise HTTPException(status_code=400, detail="voucher 不能为空")
     async with _alive_lock:
         is_new = voucher not in _alive_users
         _alive_users[voucher] = CFG.alive_initial_ttl
@@ -1166,19 +1269,18 @@ async def _kick_dead_user_once() -> None:
     async with _alive_lock:
         snapshot = list(_alive_users.items())
     for voucher, ttl in snapshot:
-        new_ttl = ttl - 1
         async with _alive_lock:
-            # 双检：snapshot 期间可能被 /alive 重置过
+            # 双检：snapshot 期间可能被 /alive 重置过。
+            # 只有当前值仍等于快照值才递减；否则说明已续期，本次 tick 不动它（M-06）
             current = _alive_users.get(voucher)
-            if current is None:
+            if current is None or current != ttl:
                 continue
-            new_ttl = min(current, new_ttl) if current is not None else new_ttl
-            if new_ttl <= 0:
+            if ttl - 1 <= 0:
                 # 倒计时归零 → voucher 失效
                 # 1) 让 scheduler 清掉这个 voucher 的所有 pending + in-flight 工作
                 _alive_users.pop(voucher, None)
             else:
-                _alive_users[voucher] = new_ttl
+                _alive_users[voucher] = ttl - 1
                 continue
         # 锁外调 scheduler.cancel_voucher（内部有自己的锁，避免嵌套锁死锁）
         if scheduler is not None:
