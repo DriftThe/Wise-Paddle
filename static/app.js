@@ -49,6 +49,8 @@ const REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
 const VOUCHER_POLL_MS = 50;
 /** PDF 占位抽帧最大宽度 */
 const PDF_PREVIEW_MAX_WIDTH = 1000;
+/** PDF 占位抽帧页数上限（防止超大 PDF 卡死浏览器） */
+const MAX_PREVIEW_PAGES = 20;
 /** Toast 显示时长 */
 const TOAST_DURATION_MS = 1500;
 
@@ -228,6 +230,7 @@ async function keepAlive() {
             method: "POST",
             headers: {"Content-Type": "application/json"},
             body: JSON.stringify({aliveVoucher}),
+            keepalive: true,
         });
         if (!response.ok) {
             console.warn(`[keepAlive] HTTP ${response.status}`);
@@ -241,19 +244,36 @@ async function keepAlive() {
 const healthPollTimerId = setInterval(pollHealth, HEALTH_POLL_INTERVAL_MS);
 pollHealth();
 
+// 隐藏/恢复标签页时补一次心跳：
+// 隐藏时用 sendBeacon（不依赖定时器精度），避免后台节流导致任务被服务端误杀（H-04）
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+        if (aliveVoucher && navigator.sendBeacon) {
+            navigator.sendBeacon(
+                "/alive",
+                new Blob([JSON.stringify({aliveVoucher})], {type: "application/json"}),
+            );
+        }
+    } else if (document.visibilityState === "visible") {
+        keepAlive();
+    }
+});
+
 // ===== PDF 占位抽帧（不占 GPU，几百 ms） =====
 /**
  * 把 PDF 文件抽成 N 张 PNG data URL，用于队列缩略图和占位卡。
  * @param {File} pdfFile
  * @param {number} [maxW=1000] - 抽帧最大宽度
- * @returns {Promise<Array<{b64:string,w:number,h:number}>>}
+ * @returns {Promise<{previews:Array<{b64:string,w:number,h:number}>, total:number}>}
  */
 async function renderPdfPages(pdfFile, maxW = PDF_PREVIEW_MAX_WIDTH) {
     if (!window.pdfjsLib) throw new Error("PDF.js 未加载");
     const buf = await pdfFile.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({data: buf}).promise;
     const out = [];
-    for (let i = 1; i <= pdf.numPages; i++) {
+    // 只抽前 MAX_PREVIEW_PAGES 页，避免超大 PDF 把浏览器卡死（M-08）
+    const lastPage = Math.min(pdf.numPages, MAX_PREVIEW_PAGES);
+    for (let i = 1; i <= lastPage; i++) {
         const page = await pdf.getPage(i);
         const baseViewport = page.getViewport({scale: 1});
         const scale = Math.min(2, maxW / baseViewport.width);
@@ -264,7 +284,7 @@ async function renderPdfPages(pdfFile, maxW = PDF_PREVIEW_MAX_WIDTH) {
         await page.render({canvasContext: canvas.getContext("2d"), viewport}).promise;
         out.push({b64: canvas.toDataURL("image/png"), w: canvas.width, h: canvas.height});
     }
-    return out;
+    return {previews: out, total: pdf.numPages};
 }
 
 // ===== Drop zone =====
@@ -301,8 +321,9 @@ async function handleFiles(fileList) {
         renderQueue();
         if (isPdf) {
             try {
-                item.previewPages = await renderPdfPages(f);
-                item.pageCount = item.previewPages.length;
+                const res = await renderPdfPages(f);
+                item.previewPages = res.previews;
+                item.pageCount = res.total;
                 renderQueue();
             } catch (e) {
                 console.error("PDF preview failed", e);
@@ -427,6 +448,15 @@ function handleCancelProcessingItem(btn, item) {
 clearQueueBtn.addEventListener("click", () => {
     queue.forEach((q) => {
         if (q.fileUrl) URL.revokeObjectURL(q.fileUrl);
+        // 处理中的任务：先通知服务端取消，再中断 fetch / 轮询（M-11）
+        if (q.status === "processing") {
+            if (q.userId) {
+                fetch(`/api/cancel/${encodeURIComponent(q.userId)}`, {method: "POST"})
+                    .catch(() => {});
+            }
+            q.pollAbort = true;
+            if (q.abortCtl) q.abortCtl.abort("queue cleared");
+        }
     });
     queue.length = 0;
     renderQueue();
@@ -508,6 +538,11 @@ async function processOne(item) {
         // 主动取消时 fetch 抛 AbortError，但 item.status 可能已经被 remove handler
         // 置为 "cancelled" —— 这种情况不要再覆盖成 error
         if (item.status === "cancelled" || item.pollAbort) return;
+        // 超时 / 网络错误：通知服务端取消，避免 GPU 任务继续空转（M-11）
+        if (item.userId) {
+            fetch(`/api/cancel/${encodeURIComponent(item.userId)}`, {method: "POST"})
+                .catch(() => {});
+        }
         item.status = "error";
         renderQueue();
         markCardError(ctl, String(e), performance.now() - t0);
@@ -553,7 +588,16 @@ async function pollPdfProgress(ctl, item, userId, initData, t0) {
         // 主动取消：用户点了 remove 按钮，停止轮询
         if (item.pollAbort) return;
         try {
-            const r = await fetch(pollUrl, {cache: "no-store"});
+            // 增量拉取：从第一个未填充页开始取，降低轮询带宽（M-12）
+            let since = 0;
+            for (let i = 0; i < totalPages; i++) {
+                if (!filledPages.has(i)) {
+                    since = i;
+                    break;
+                }
+            }
+            const sep = pollUrl.includes("?") ? "&" : "?";
+            const r = await fetch(`${pollUrl}${sep}since=${since}`, {cache: "no-store"});
             if (!r.ok) {
                 setTimeout(tick, PDF_POLL_INTERVAL_MS);
                 return;
