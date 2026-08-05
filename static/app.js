@@ -1,53 +1,87 @@
 // ============================================================================
-// Wise-Paddle · 前端逻辑
+// Wise-Paddle · 前端逻辑  v0.6.0  (含主动 cancel 路径，2026-07-28)
 // ----------------------------------------------------------------------------
 // 配套 HTML: static/index.html
+//
 // 入口顺序（按代码出现顺序）:
-//   1. PDF.js 初始化
+//   1. 常量 + PDF.js 初始化
 //   2. DOM 引用 + 全局状态
 //   3. 工具函数 (uid / showToast / copyText / escape)
-//   4. /health 轮询
+//   4. /health 轮询 + 心跳保活
 //   5. PDF 占位抽帧
 //   6. 拖拽 / 文件输入
-//   7. 队列渲染 / 清空
-//   8. 开始处理 / processOne
-//   9. PDF 流式轮询 (pollPdfProgress)
+//   7. 队列渲染 / 清空 (remove 按钮：pending→仅删；processing→主动 cancel 路径)
+//   8. 开始处理 / processOne (给 item 存 userId/ctl/abortCtl/pollAbort 给 §7 用)
+//   9. PDF 流式轮询 (pollPdfProgress) 顶部检查 item.pollAbort
 //  10. 增量填页 (fillOnePageSlot)
 //  11. 占位卡构造 (buildPlaceholderCard)
 //  12. 拿到结果后升级 (fillCardWithResult)
 //  13. canvas 框 + hover-copy (wirePageCanvas)
-//  14. 错误状态 (markCardError)
+//  14. 错误 / 取消状态 (markCardError / markCardCancelled)
 //  15. 框绘制 / 命中测试 (hitTestBox / drawBoxes)
 //  16. 多结果导航 (result-switcher)
 //  17. 清空结果
+//
+// 主动取消链路: §7 按钮 → fetch /api/cancel/{userId} + abortCtl.abort() + pollAbort=true
+//   → 服务端 scheduler.cancel_request(userId) 取消 pending futs
+//   → _cancelled_requests 进 process_batch 两层过滤
+//   → 单图 handler CancelledError → 200 cancelled；PDF task.cancel() → progress.cancelled=true
+//   → 前端 markCardCancelled 标 "已取消" + toast "任务已取消"
 // ============================================================================
 "use strict";
 
+// ===== 常量 =====
+/** PDF.js 版本（与 index.html 里的 <script src> 保持一致） */
+const PDFJS_VERSION = "3.11.174";
+/** PDF.js CDN base URL */
+const PDFJS_CDN_BASE = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/legacy/build`;
+/** /health 轮询间隔 */
+const HEALTH_POLL_INTERVAL_MS = 1500;
+/** 心跳保活间隔 */
+const KEEPALIVE_INTERVAL_MS = 5000;
+/** PDF 进度轮询间隔 */
+const PDF_POLL_INTERVAL_MS = 1500;
+/** PDF 进度轮询失败后重试间隔 */
+const PDF_POLL_RETRY_MS = 2500;
+/** 单图请求总超时（避免挂死） */
+const REQUEST_TIMEOUT_MS = 15 * 60 * 1000;
+/** waitForLegalVoucher 轮询间隔 */
+const VOUCHER_POLL_MS = 50;
+/** PDF 占位抽帧最大宽度 */
+const PDF_PREVIEW_MAX_WIDTH = 1000;
+/** Toast 显示时长 */
+const TOAST_DURATION_MS = 1500;
+
 // ===== PDF.js setup =====
 if (window.pdfjsLib) {
-    pdfjsLib.GlobalWorkerOptions.workerSrc =
-        "https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.worker.min.js";
+    pdfjsLib.GlobalWorkerOptions.workerSrc = `${PDFJS_CDN_BASE}/pdf.worker.min.js`;
 }
 
+// ===== DOM 引用 + 全局状态 =====
 const $ = (sel) => document.querySelector(sel);
 const resultList = $("#result-list");
-const empty = $("#empty");
-const toast = $("#toast");
+const emptyState = $("#empty");
+const toastEl = $("#toast");
 const queueSection = $("#queue-section");
 const queueEl = $("#queue");
 const queueCountEl = $("#queue-count");
 const startBtn = $("#start-btn");
 const clearQueueBtn = $("#clear-queue-btn");
 const clearResultsBtn = $("#clear-results-btn");
-const queueStatus = $("#queue-status");
+const queueStatusEl = $("#queue-status");
 const fileInput = $("#file-input");
-const rs = $("#result-switcher");
+const resultSwitcher = $("#result-switcher");
 const rsTabs = $("#rs-tabs");
 const rsPrev = $("#rs-prev");
 const rsNext = $("#rs-next");
 const rsInfo = $("#rs-info");
-let aliveVoucher = ""; // 确认存活的唯一ID
+
+/** 当前会话的存活 voucher；空字符串表示尚未从 /health 拿到 */
+let aliveVoucher = "";
+/** 结果卡片自增序号（用于 tab + 滚动定位） */
 let resultSeq = 0;
+/** 心跳定时器 ID（只在 voucher 首次拿到后启动一次） */
+let keepAliveTimerId = null;
 
 // ===== 队列状态 =====
 /**
@@ -57,25 +91,49 @@ let resultSeq = 0;
  * @property {boolean} isPdf
  * @property {string|null} fileUrl        - 单图的 ObjectURL
  * @property {number} pageCount          - 1 = 单图, N = PDF 页数
- * @property {string} status             - pending | processing | done | error
+ * @property {string} status             - pending | processing | done | error | cancelled
  * @property {Array<{b64:string,w:number,h:number}>} previewPages  - PDF 抽帧占位
+ * @property {string} [userId]           - processOne 时分配的 client user_id
+ * @property {Object} [ctl]              - 结果卡 controller
+ * @property {number} [t0]               - performance.now() 起点
+ * @property {AbortController} [abortCtl] - 单图 fetch 的 AbortController
+ * @property {boolean} [pollAbort]       - PDF 轮询是否应停止
  */
 
 /** @type {QueueItem[]} */
 const queue = [];
 
+// ===== 工具函数 =====
+/**
+ * 生成一个 8 字符的随机 ID（用于 queue item id 和 client user_id）。
+ * @returns {string}
+ */
 function uid() {
     return Math.random().toString(36).slice(2, 10);
 }
 
+/**
+ * 在底部 toast 显示一条消息。
+ * @param {string} msg
+ * @param {boolean} [isErr=false] - true 显示红色错误样式
+ */
 function showToast(msg, isErr = false) {
-    toast.textContent = msg;
-    toast.classList.toggle("err", isErr);
-    toast.classList.add("show");
-    clearTimeout(showToast._t);
-    showToast._t = setTimeout(() => toast.classList.remove("show"), 1500);
+    toastEl.textContent = msg;
+    toastEl.classList.toggle("err", isErr);
+    toastEl.classList.add("show");
+    clearTimeout(showToast._timer);
+    showToast._timer = setTimeout(
+        () => toastEl.classList.remove("show"),
+        TOAST_DURATION_MS,
+    );
 }
 
+/**
+ * 复制文本到剪贴板。优先用 Clipboard API，失败时回退到 deprecated execCommand。
+ * @param {string} text
+ * @param {boolean} [silent=false] - true 时不弹 toast
+ * @returns {Promise<boolean>} 是否复制成功
+ */
 async function copyText(text, silent = false) {
     if (!text) {
         if (!silent) showToast("该区域无文字", true);
@@ -84,65 +142,113 @@ async function copyText(text, silent = false) {
     try {
         await navigator.clipboard.writeText(text);
     } catch (e) {
-        // 兼容严格安全的情况: 如http协议，沙盒环境等未启用Clipboard API的情况
+        // 兼容严格安全的情况: 如 http 协议、沙盒环境等未启用 Clipboard API 的情况
+        // execCommand 已废弃，但作为 fallback 仍是最可靠的兜底方案
         const ta = document.createElement("textarea");
         ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
         document.body.appendChild(ta);
         ta.select();
-        document.execCommand("copy");
+        try {
+            document.execCommand("copy");
+        } catch (copyErr) {
+            if (!silent) showToast("复制失败", true);
+            ta.remove();
+            return false;
+        }
         ta.remove();
     }
     if (!silent) showToast(`已复制 ${text.length} 字符`);
     return true;
 }
 
-// ===== Health polling =====
-const heathLoopID = setInterval(pollHealth, 1500);
+/**
+ * HTML-escape a string for safe insertion into textContent / innerHTML.
+ * Escapes & < > " ' — sufficient for both element text and attribute context.
+ * @param {string} s
+ * @returns {string}
+ */
+function escapeHtml(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (c) =>
+        ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]),
+    );
+}
 
+/**
+ * Attribute-escape a string for safe insertion into a double-quoted attribute.
+ * Escapes & < > " to cover all attribute-injection vectors (not just quotes).
+ * @param {string} s
+ * @returns {string}
+ */
+function escapeAttr(s) {
+    return String(s ?? "").replace(/[&<>"]/g, (c) =>
+        ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]),
+    );
+}
+
+// ===== Health polling + KeepAlive =====
+/**
+ * 轮询 /health：拿到 aliveVoucher 后启动心跳保活。
+ * 拿到 voucher 之前每 1.5s 重试一次；拿到后停止重试（保留定时器无意义）。
+ */
 async function pollHealth() {
     try {
         if (aliveVoucher === "") {
             const r = await fetch("/health");
+            if (!r.ok) {
+                showToast(`HTTP ${r.status} - /health 异常`, true);
+                return;
+            }
             const d = await r.json();
             $("#stat-pool").textContent = `${d.pool_free}/${d.pool_size}`;
             $("#stat-pending").textContent = d.scheduler_pending;
             $("#stat-batch").textContent = d.batch_max;
             aliveVoucher = d.alive_voucher;
-            // $("#alive-keeping-id").textContent = aliveVoucher;
-            console.log(aliveVoucher);
-            clearInterval(heathLoopID);
-            const aliveLoopID = setInterval(KeepAlive, 5000);
-            await KeepAlive();
-        } else {
-            // clearInterval(heathLoopID);
+            // 启动心跳（只在首次拿到 voucher 时启动一次，避免重复 setInterval）
+            if (keepAliveTimerId === null) {
+                keepAliveTimerId = setInterval(keepAlive, KEEPALIVE_INTERVAL_MS);
+                await keepAlive();
+            }
         }
-    } catch (e) { /* ignore */
-        console.log(e)
+    } catch (e) {
+        console.warn("[pollHealth] failed:", e);
         showToast("404 - 与主机失去连接", true);
     }
 }
 
-pollHealth();
-
-// ===== Connection Alive Prove =====
-async function KeepAlive() {
+/**
+ * 发送心跳到 /alive，刷新服务端 voucher TTL。
+ * 失败时不弹错误 toast（避免心跳失败时频繁打扰用户），仅 console.warn。
+ */
+async function keepAlive() {
+    if (!aliveVoucher) return;
     try {
         const response = await fetch("/alive", {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-                aliveVoucher: aliveVoucher,
-            })
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({aliveVoucher}),
         });
+        if (!response.ok) {
+            console.warn(`[keepAlive] HTTP ${response.status}`);
+        }
     } catch (e) {
-        showToast("404 - 与主机失去连接", true);
+        console.warn("[keepAlive] failed:", e);
     }
 }
 
+// 启动 /health 轮询
+const healthPollTimerId = setInterval(pollHealth, HEALTH_POLL_INTERVAL_MS);
+pollHealth();
+
 // ===== PDF 占位抽帧（不占 GPU，几百 ms） =====
-async function renderPdfPages(pdfFile, maxW = 1000) {
+/**
+ * 把 PDF 文件抽成 N 张 PNG data URL，用于队列缩略图和占位卡。
+ * @param {File} pdfFile
+ * @param {number} [maxW=1000] - 抽帧最大宽度
+ * @returns {Promise<Array<{b64:string,w:number,h:number}>>}
+ */
+async function renderPdfPages(pdfFile, maxW = PDF_PREVIEW_MAX_WIDTH) {
     if (!window.pdfjsLib) throw new Error("PDF.js 未加载");
     const buf = await pdfFile.arrayBuffer();
     const pdf = await pdfjsLib.getDocument({data: buf}).promise;
@@ -162,19 +268,23 @@ async function renderPdfPages(pdfFile, maxW = 1000) {
 }
 
 // ===== Drop zone =====
-const dz = $("#drop-zone");
-dz.addEventListener("dragover", (e) => {
+const dropZone = $("#drop-zone");
+dropZone.addEventListener("dragover", (e) => {
     e.preventDefault();
-    dz.classList.add("drag-over");
+    dropZone.classList.add("drag-over");
 });
-dz.addEventListener("dragleave", () => dz.classList.remove("drag-over"));
-dz.addEventListener("drop", (e) => {
+dropZone.addEventListener("dragleave", () => dropZone.classList.remove("drag-over"));
+dropZone.addEventListener("drop", (e) => {
     e.preventDefault();
-    dz.classList.remove("drag-over");
+    dropZone.classList.remove("drag-over");
     handleFiles(e.dataTransfer.files);
 });
 fileInput.addEventListener("change", (e) => handleFiles(e.target.files));
 
+/**
+ * 处理用户拖入 / 选择的文件列表。PDF 异步抽帧；单图直接生成 ObjectURL。
+ * @param {FileList|File[]} fileList
+ */
 async function handleFiles(fileList) {
     for (const f of fileList) {
         const isPdf = f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
@@ -196,7 +306,7 @@ async function handleFiles(fileList) {
                 renderQueue();
             } catch (e) {
                 console.error("PDF preview failed", e);
-                showToast("PDF 预览失败：" + e.message, true);
+                showToast(`PDF 预览失败：${e.message}`, true);
                 item.status = "error";
                 renderQueue();
             }
@@ -205,9 +315,12 @@ async function handleFiles(fileList) {
     fileInput.value = "";
 }
 
+/**
+ * 渲染队列 UI。每次 queue 状态变化都全量重渲染（队列通常很短，O(n) 可接受）。
+ */
 function renderQueue() {
-    const pending = queue.filter(q => q.status === "pending").length;
-    const processing = queue.filter(q => q.status === "processing").length;
+    const pending = queue.filter((q) => q.status === "pending").length;
+    const processing = queue.filter((q) => q.status === "processing").length;
     queueCountEl.textContent = String(queue.length);
     if (queue.length === 0) {
         queueSection.style.display = "none";
@@ -216,7 +329,7 @@ function renderQueue() {
     queueSection.style.display = "";
     startBtn.disabled = pending === 0;
 
-    queueEl.innerHTML = queue.map(q => {
+    queueEl.innerHTML = queue.map((q) => {
         let thumb;
         let extraTag = "";
         if (q.isPdf) {
@@ -225,41 +338,94 @@ function renderQueue() {
             const pagesTag = q.pageCount > 1 ? `<span class="pages-tag">${q.pageCount} 页</span>` : "";
             extraTag = pagesTag;
             thumb = src
-                ? `<img src="${src}" alt="pdf" />`
+                ? `<img src="${escapeAttr(src)}" alt="pdf" />`
                 : `<div style="display:flex;align-items:center;justify-content:center;height:100%;font-size:32px;color:var(--warn);">PDF</div>`;
         } else {
-            thumb = `<img src="${q.fileUrl}" alt="" />`;
+            thumb = `<img src="${escapeAttr(q.fileUrl || "")}" alt="" />`;
         }
-        const statusLabel = {pending: "待处理", processing: "处理中", done: "完成", error: "失败"}[q.status];
+        const statusLabel = QUEUE_STATUS_LABEL[q.status] || q.status;
         return `
-      <div class="queue-item ${q.status}" data-id="${q.id}">
+      <div class="queue-item ${escapeAttr(q.status)}" data-id="${escapeAttr(q.id)}">
         ${thumb}
         ${extraTag}
-        <span class="badge ${q.status}">${statusLabel}</span>
-        <button class="remove" data-id="${q.id}" title="移除">×</button>
+        <span class="badge ${escapeAttr(q.status)}">${escapeHtml(statusLabel)}</span>
+        <button class="remove" data-id="${escapeAttr(q.id)}" title="移除" aria-label="移除">×</button>
         <div class="file-name">${escapeHtml(q.file.name)}</div>
       </div>`;
     }).join("");
 
-    queueStatus.textContent = processing > 0
+    queueStatusEl.textContent = processing > 0
         ? `处理中 ${processing} 个文件，剩 ${pending} 个待处理`
         : (pending > 0 ? `${pending} 个待处理` : (queue.length > 0 ? `全部 ${queue.length} 个已完成` : ""));
 
-    queueEl.querySelectorAll(".remove").forEach(btn => {
-        btn.addEventListener("click", () => {
+    queueEl.querySelectorAll(".remove").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+            e.stopPropagation();
             const id = btn.dataset.id;
-            const idx = queue.findIndex(q => q.id === id);
-            if (idx >= 0) {
-                if (queue[idx].fileUrl) URL.revokeObjectURL(queue[idx].fileUrl);
-                queue.splice(idx, 1);
-                renderQueue();
+            const idx = queue.findIndex((q) => q.id === id);
+            if (idx < 0) return;
+            const item = queue[idx];
+            console.log("[Wise-Paddle] remove clicked:", id, "status=", item.status, "userId=", item.userId);
+            if (item.status === "processing") {
+                handleCancelProcessingItem(btn, item);
+                return;
             }
+            // pending / done / error / cancelled：仅从队列里清掉
+            if (item.fileUrl) URL.revokeObjectURL(item.fileUrl);
+            queue.splice(idx, 1);
+            renderQueue();
         });
     });
 }
 
+/** 队列状态 → 中文标签映射 */
+const QUEUE_STATUS_LABEL = {
+    pending: "待处理",
+    processing: "处理中",
+    done: "完成",
+    error: "失败",
+    cancelled: "已取消",
+};
+
+/**
+ * 处理"正在处理中的 item 被 remove"的主动取消路径。
+ * 4 步：通知服务端 cancel → abort fetch → 停 PDF 轮询 → UI 立即标 cancelled。
+ * @param {HTMLButtonElement} btn - 被点击的 remove 按钮
+ * @param {QueueItem} item
+ */
+function handleCancelProcessingItem(btn, item) {
+    // 1) 通知服务端 cancel（fire-and-forget，scheduler 那边会 cancel futs）
+    if (item.userId) {
+        fetch(`/api/cancel/${encodeURIComponent(item.userId)}`, {method: "POST"})
+            .catch((err) => console.warn("[Wise-Paddle] cancel fetch error:", err));
+    }
+    // 2) 中断进行中的 fetch（单图同步路径会立刻抛 AbortError）
+    if (item.abortCtl) item.abortCtl.abort("user cancelled");
+    // 3) 通知 pollPdfProgress 停止轮询（PDF 异步路径）
+    item.pollAbort = true;
+    // 4) UI 立刻置 cancelled —— 不等服务端响应，前端先给反馈
+    item.status = "cancelled";
+    const wallMs = item.t0 ? (performance.now() - item.t0) : 0;
+    if (item.ctl) markCardCancelled(item.ctl, item, wallMs);
+    // 直接修改 queue-item 元素，让用户立即看到变化（不等 renderQueue）
+    const itemEl = btn.closest(".queue-item");
+    if (itemEl) {
+        itemEl.classList.remove("processing", "pending", "done", "error");
+        itemEl.classList.add("cancelled");
+        const badge = itemEl.querySelector(".badge");
+        if (badge) {
+            badge.classList.remove("processing", "pending", "done", "error");
+            badge.classList.add("cancelled");
+            badge.textContent = "已取消";
+        }
+    }
+    showToast("任务已取消");
+    // 最后再 renderQueue 同步 queue 数组（不再 splice，所以 item 还在）
+    renderQueue();
+}
+
 clearQueueBtn.addEventListener("click", () => {
-    queue.forEach(q => {
+    queue.forEach((q) => {
         if (q.fileUrl) URL.revokeObjectURL(q.fileUrl);
     });
     queue.length = 0;
@@ -268,13 +434,17 @@ clearQueueBtn.addEventListener("click", () => {
 
 // ===== 开始处理 =====
 startBtn.addEventListener("click", async () => {
-    const items = queue.filter(q => q.status === "pending" && (!q.isPdf || q.pageCount > 0));
+    const items = queue.filter((q) => q.status === "pending" && (!q.isPdf || q.pageCount > 0));
     if (items.length === 0) return;
-    items.forEach(q => q.status = "processing");
+    items.forEach((q) => q.status = "processing");
     renderQueue();
-    await Promise.all(items.map(q => processOne(q)));
+    await Promise.all(items.map((q) => processOne(q)));
 });
 
+/**
+ * 处理一个 queue item：建占位卡 → 提交 OCR → 根据单图/PDF 走不同路径。
+ * @param {QueueItem} item
+ */
 async function processOne(item) {
     await waitForLegalVoucher();
     const t0 = performance.now();
@@ -283,19 +453,34 @@ async function processOne(item) {
     // 2) 申请一个 client-side user_id, 通过 query string 传给服务端做 per-user 输出隔离
     const clientUserId = `web-${uid()}`;
     // 同时带上 session 级的 aliveVoucher（pollHealth 第一次拉 /health 时拿到）
-    // —— 服务端 KickDeadUser 倒计时归零时调 scheduler.cancel_voucher(aliveVoucher)，
+    // —— 服务端 _kick_dead_user_loop 倒计时归零时调 scheduler.cancel_voucher(aliveVoucher)，
     // 把这个 voucher 名下所有 pending + in-flight 一起干掉
     const url = item.isPdf ? "/ocr/pdf" : "/ocr/upload";
     const qs = new URLSearchParams({
         user_id: clientUserId,
         voucher_id: aliveVoucher || "",
     });
+    // 3) 在 item 上存取消需要的字段：remove 按钮 handler 要用
+    item.userId = clientUserId;
+    item.ctl = ctl;
+    item.t0 = t0;
+    item.abortCtl = new AbortController();
+    item.pollAbort = false;
+    // 总超时（避免挂死）
+    const timeoutId = setTimeout(
+        () => item.abortCtl.abort("timeout"),
+        REQUEST_TIMEOUT_MS,
+    );
     try {
         const fd = new FormData();
         fd.append("file", item.file);
-        const r = await fetch(`${url}?${qs.toString()}`,
-            {method: "POST", body: fd, signal: AbortSignal.timeout(900_000)});
+        const r = await fetch(
+            `${url}?${qs.toString()}`,
+            {method: "POST", body: fd, signal: item.abortCtl.signal},
+        );
+        clearTimeout(timeoutId);
         const wallMs = performance.now() - t0;
+        // 主动取消时 fetch 抛 AbortError —— 走到 catch 分支，由 catch 区分"主动取消"vs"真错误"
         if (!r.ok) {
             const err = await r.json().catch(() => ({}));
             item.status = "error";
@@ -313,28 +498,43 @@ async function processOne(item) {
             pollPdfProgress(ctl, item, clientUserId, data, t0);
         } else {
             // 单图 / base64: 同步响应, 立即填充
-            const wallMs = performance.now() - t0;
+            const wallMs2 = performance.now() - t0;
             item.status = "done";
             renderQueue();
-            fillCardWithResult(ctl, item, data, wallMs);
+            fillCardWithResult(ctl, item, data, wallMs2);
         }
     } catch (e) {
+        clearTimeout(timeoutId);
+        // 主动取消时 fetch 抛 AbortError，但 item.status 可能已经被 remove handler
+        // 置为 "cancelled" —— 这种情况不要再覆盖成 error
+        if (item.status === "cancelled" || item.pollAbort) return;
         item.status = "error";
         renderQueue();
         markCardError(ctl, String(e), performance.now() - t0);
     }
 }
 
+/**
+ * 等待 aliveVoucher 从服务端拿到（pollHealth 第一次成功后才有值）。
+ * 用 VOUCHER_POLL_MS 间隔的轮询，避免 CPU 空转。
+ * @returns {Promise<void>}
+ */
 async function waitForLegalVoucher() {
-    while (aliveVoucher === "" || aliveVoucher === null) {
-        await new Promise(resolve => setTimeout(resolve, 50));
+    while (!aliveVoucher) {
+        await new Promise((resolve) => setTimeout(resolve, VOUCHER_POLL_MS));
     }
 }
 
 /**
- * PDF 流式轮询: 每 1.5s 拉一次 /api/ocr/pdf-status/{user_id},
+ * PDF 流式轮询: 每 PDF_POLL_INTERVAL_MS 拉一次 /api/ocr/pdf-status/{user_id},
  * 每收到新 page 立即更新对应 page-slot (而不是等所有 page 跑完).
  * 全部 done 后停止轮询.
+ *
+ * @param {Object} ctl - buildPlaceholderCard 返回的 controller
+ * @param {QueueItem} item
+ * @param {string} userId
+ * @param {Object} initData - /ocr/pdf 返回的初始数据（含 poll_url, total_pages）
+ * @param {number} t0 - performance.now() 起点
  */
 async function pollPdfProgress(ctl, item, userId, initData, t0) {
     const totalPages = initData.total_pages;
@@ -346,14 +546,16 @@ async function pollPdfProgress(ctl, item, userId, initData, t0) {
     if (rid) rid.textContent = (userId || "").replace(/^web-/, "");
     const pageinfo = ctl.head.querySelector('[data-role="pageinfo"]');
     if (pageinfo) pageinfo.textContent = `0 / ${totalPages} 页 · 处理中…`;
-    const status = ctl.head.querySelector('[data-role="status"]');
-    if (status) status.textContent = "处理中";
+    const statusEl = ctl.head.querySelector('[data-role="status"]');
+    if (statusEl) statusEl.textContent = "处理中";
 
     const tick = async () => {
+        // 主动取消：用户点了 remove 按钮，停止轮询
+        if (item.pollAbort) return;
         try {
             const r = await fetch(pollUrl, {cache: "no-store"});
             if (!r.ok) {
-                setTimeout(tick, 1500);
+                setTimeout(tick, PDF_POLL_INTERVAL_MS);
                 return;
             }
             const data = await r.json();
@@ -380,28 +582,37 @@ async function pollPdfProgress(ctl, item, userId, initData, t0) {
             const doneCount = data.done_count || filledPages.size;
             const phaseLabel = data.cancelled ? "已取消" : (data.done ? "完成" : "处理中");
             if (pageinfo) pageinfo.textContent = `${doneCount} / ${totalPages} 页 · ${data.done ? "完成" : "处理中…"}`;
-            if (status) status.textContent = `${phaseLabel} ${doneCount}/${totalPages}`;
+            if (statusEl) statusEl.textContent = `${phaseLabel} ${doneCount}/${totalPages}`;
 
             if (data.done || data.cancelled || data.error) {
                 const wallMs = performance.now() - t0;
-                item.status = (data.cancelled || data.error) ? "error" : "done";
+                if (data.cancelled) {
+                    item.status = "cancelled";
+                } else if (data.error) {
+                    item.status = "error";
+                } else {
+                    item.status = "done";
+                }
                 renderQueue();
                 if (data.error) {
                     markCardError(ctl, data.error, wallMs);
                 } else if (data.cancelled) {
-                    markCardError(ctl, "服务端取消", wallMs);
+                    // 服务端取消（voucher 倒计时归零等）：跟前端主动 cancel 同一套 UI
+                    markCardCancelled(ctl, item, wallMs);
                 }
                 // 切所有未完成 page-slot 状态
                 for (let i = 0; i < ctl.totalPages; i++) {
                     if (!filledPages.has(i)) {
                         if (ctl.pageSlots[i]) {
-                            ctl.pageSlots[i].dataset.status = (data.cancelled || data.error) ? "error" : "waiting";
+                            ctl.pageSlots[i].dataset.status = data.cancelled ? "cancelled" :
+                                (data.error ? "error" : "waiting");
                         }
                         if (ctl.chips) {
                             const chip = ctl.chips.querySelector(`.page-chip[data-page-index="${i}"]`);
                             if (chip) {
                                 chip.classList.remove("processing");
-                                if (data.cancelled || data.error) chip.classList.add("error");
+                                if (data.cancelled) chip.classList.add("cancelled");
+                                else if (data.error) chip.classList.add("error");
                             }
                         }
                     }
@@ -409,10 +620,13 @@ async function pollPdfProgress(ctl, item, userId, initData, t0) {
                 // timing 更新
                 const big = ctl.head.querySelector('[data-role="server"]');
                 if (big) {
-                    big.classList.remove("processing");
-                    if (data.cancelled || data.error) {
+                    big.classList.remove("processing", "error", "cancelled");
+                    if (data.cancelled) {
+                        big.classList.add("cancelled");
+                        big.textContent = "取消";
+                    } else if (data.error) {
                         big.classList.add("error");
-                        big.textContent = data.cancelled ? "取消" : "失败";
+                        big.textContent = "失败";
                     } else {
                         big.innerHTML = `${(wallMs / 1000).toFixed(2)}<span style="font-size:14px;color:var(--fg-dim);">s</span>`;
                     }
@@ -421,9 +635,9 @@ async function pollPdfProgress(ctl, item, userId, initData, t0) {
                 if (wallEl) wallEl.textContent = `${(wallMs / 1000).toFixed(2)}s`;
                 return;  // 停止轮询
             }
-            setTimeout(tick, 1500);
+            setTimeout(tick, PDF_POLL_INTERVAL_MS);
         } catch (e) {
-            setTimeout(tick, 2500);  // 网络错误慢点重试
+            setTimeout(tick, PDF_POLL_RETRY_MS);  // 网络错误慢点重试
         }
     };
     tick();
@@ -431,6 +645,10 @@ async function pollPdfProgress(ctl, item, userId, initData, t0) {
 
 /**
  * 单 page 增量更新: 把一个已完成 page 的 OCR 结果填到对应 page-slot
+ * @param {Object} ctl
+ * @param {QueueItem} item
+ * @param {number} pageIndex
+ * @param {Object} pageData
  */
 function fillOnePageSlot(ctl, item, pageIndex, pageData) {
     const isPdf = item.isPdf;
@@ -461,24 +679,7 @@ function fillOnePageSlot(ctl, item, pageIndex, pageData) {
         }
     }
     // 填 region 卡片
-    const regionsEl = slot.querySelector(`[data-role="regions-${pageIndex}"]`);
-    const pageRegions = pageData.regions || [];
-    if (regionsEl) {
-        if (pageRegions.length === 0) {
-            regionsEl.innerHTML = `<div class="empty-state" style="grid-column:1/-1;padding:12px;">未检测到任何区域</div>`;
-        } else {
-            regionsEl.innerHTML = pageRegions.map((r, j) => `
-        <div class="region" data-idx="${j}" data-page="${pageIndex}" data-label="${escapeHtml(r.label)}"
-             data-rect="${r.rect.join(",")}" data-score="${r.score}">
-          <div class="r-head">
-            <span class="r-label">${escapeHtml(r.label)}</span>
-            <span class="r-score">${(r.score * 100).toFixed(1)}% · #${j}</span>
-          </div>
-          <div class="r-text">${escapeHtml(r.markdown || "")}</div>
-          <div class="r-hint">悬停框即复制</div>
-        </div>`).join("");
-        }
-    }
+    fillRegionsInSlot(slot, pageIndex, pageData.regions || []);
     // wire canvas 检测框 + hover-copy
     if (typeof wirePageCanvas === "function") wirePageCanvas(ctl, pageIndex);
     ctl.card.dataset.status = "done";
@@ -486,14 +687,39 @@ function fillOnePageSlot(ctl, item, pageIndex, pageData) {
     if (typeof updateResultTab === "function") updateResultTab(ctl.seq, "done");
 }
 
+/**
+ * 把 regions 列表渲染到 slot 内的 regions 容器。
+ * @param {HTMLElement} slot
+ * @param {number} pageIndex
+ * @param {Array} pageRegions
+ */
+function fillRegionsInSlot(slot, pageIndex, pageRegions) {
+    const regionsEl = slot.querySelector(`[data-role="regions-${pageIndex}"]`);
+    if (!regionsEl) return;
+    if (pageRegions.length === 0) {
+        regionsEl.innerHTML = `<div class="empty-state" style="grid-column:1/-1;padding:12px;">未检测到任何区域</div>`;
+        return;
+    }
+    regionsEl.innerHTML = pageRegions.map((r, j) => `
+        <div class="region" data-idx="${j}" data-page="${pageIndex}" data-label="${escapeAttr(r.label)}"
+             data-rect="${escapeAttr(r.rect.join(","))}" data-score="${escapeAttr(String(r.score))}">
+          <div class="r-head">
+            <span class="r-label">${escapeHtml(r.label)}</span>
+            <span class="r-score">${(r.score * 100).toFixed(1)}% · #${j}</span>
+          </div>
+          <div class="r-text">${escapeHtml(r.markdown || "")}</div>
+        </div>`).join("");
+}
+
 // ===== Result card 构造 =====
 
 /**
  * 立即建一个"处理中"占位卡：head 显示文件名 + "提交中"，所有 page-slot 状态=processing。
- * 返回 controller 供 fillCardWithResult / markCardError 后续操作。
+ * @param {QueueItem} item
+ * @returns {Object} controller — 供 fillCardWithResult / markCardError 后续操作
  */
 function buildPlaceholderCard(item) {
-    empty.style.display = "none";
+    emptyState.style.display = "none";
     const seq = ++resultSeq;
     const card = document.createElement("div");
     card.className = "result-card";
@@ -616,6 +842,10 @@ function buildPlaceholderCard(item) {
 
 /**
  * 拿到 server 数据后，把占位卡升级为 done 状态：填 region、wire canvas、更新 timing
+ * @param {Object} ctl
+ * @param {QueueItem} item
+ * @param {Object} data
+ * @param {number} wallMs
  */
 function fillCardWithResult(ctl, item, data, wallMs) {
     const isPdf = item.isPdf;
@@ -629,8 +859,8 @@ function fillCardWithResult(ctl, item, data, wallMs) {
     if (rid) rid.textContent = data.request_id || "—";
     const pageinfo = ctl.head.querySelector('[data-role="pageinfo"]');
     if (pageinfo) pageinfo.textContent = `${totalPages} 页 · ${regions.length} regions`;
-    const status = ctl.head.querySelector('[data-role="status"]');
-    if (status) status.textContent = "完成";
+    const statusEl = ctl.head.querySelector('[data-role="status"]');
+    if (statusEl) statusEl.textContent = "完成";
     const big = ctl.head.querySelector('[data-role="server"]');
     if (big) {
         big.classList.remove("processing");
@@ -640,17 +870,17 @@ function fillCardWithResult(ctl, item, data, wallMs) {
     }
     const wallEl = ctl.head.querySelector('[data-role="wall"]');
     if (wallEl) wallEl.textContent = `${(wallMs / 1000).toFixed(2)}s`;
-    const queueEl = ctl.head.querySelector('[data-role="queue"]');
-    if (queueEl) queueEl.textContent = `${(Number(data.queue_wait_seconds) || 0).toFixed(2)}s`;
+    const queueWaitEl = ctl.head.querySelector('[data-role="queue"]');
+    if (queueWaitEl) queueWaitEl.textContent = `${(Number(data.queue_wait_seconds) || 0).toFixed(2)}s`;
 
     // 2) 启用 nav 按钮
     if (ctl.nav) {
         ctl.nav.querySelector('[data-role="prev"]').addEventListener("click", () => {
-            const active = Array.from(ctl.chips.querySelectorAll(".page-chip")).findIndex(c => c.classList.contains("active"));
+            const active = Array.from(ctl.chips.querySelectorAll(".page-chip")).findIndex((c) => c.classList.contains("active"));
             if (active > 0) ctl.showPage(active - 1);
         });
         ctl.nav.querySelector('[data-role="next"]').addEventListener("click", () => {
-            const active = Array.from(ctl.chips.querySelectorAll(".page-chip")).findIndex(c => c.classList.contains("active"));
+            const active = Array.from(ctl.chips.querySelectorAll(".page-chip")).findIndex((c) => c.classList.contains("active"));
             if (active < ctl.totalPages - 1) ctl.showPage(active + 1);
         });
     }
@@ -697,24 +927,8 @@ function fillCardWithResult(ctl, item, data, wallMs) {
             }
         }
         // regions
-        const pageRegions = regions.filter(r => r.page_index === i);
-        const regionsEl = slot.querySelector(`[data-role="regions-${i}"]`);
-        if (regionsEl) {
-            if (pageRegions.length === 0) {
-                regionsEl.innerHTML = `<div class="empty-state" style="grid-column:1/-1;padding:12px;">未检测到任何区域</div>`;
-            } else {
-                regionsEl.innerHTML = pageRegions.map((r, j) => `
-          <div class="region" data-idx="${j}" data-page="${i}" data-label="${escapeHtml(r.label)}"
-               data-rect="${r.rect.join(",")}" data-score="${r.score}">
-            <div class="r-head">
-              <span class="r-label">${escapeHtml(r.label)}</span>
-              <span class="r-score">${(r.score * 100).toFixed(1)}% · #${j}</span>
-            </div>
-            <div class="r-text">${escapeHtml(r.markdown || "")}</div>
-            <div class="r-hint">悬停框即复制</div>
-          </div>`).join("");
-            }
-        }
+        const pageRegions = regions.filter((r) => r.page_index === i);
+        fillRegionsInSlot(slot, i, pageRegions);
         // wire canvas 检测框 + hover-copy
         wirePageCanvas(ctl, i);
     }
@@ -725,6 +939,11 @@ function fillCardWithResult(ctl, item, data, wallMs) {
     }
 }
 
+/**
+ * 给一个 page-slot 的 canvas 绑定检测框绘制 + hover 高亮 + click 复制。
+ * @param {Object} ctl
+ * @param {number} pageIdx
+ */
 function wirePageCanvas(ctl, pageIdx) {
     const slot = ctl.pageSlots[pageIdx];
     const wrap = slot.querySelector('[data-role="wrap"]');
@@ -734,7 +953,7 @@ function wirePageCanvas(ctl, pageIdx) {
     const regionEls = Array.from(slot.querySelectorAll(".region"));
     if (regionEls.length === 0) return;
 
-    const regionData = regionEls.map(el => ({
+    const regionData = regionEls.map((el) => ({
         label: el.dataset.label,
         score: parseFloat(el.dataset.score),
         rect: el.dataset.rect.split(",").map(Number),
@@ -766,7 +985,7 @@ function wirePageCanvas(ctl, pageIdx) {
     if (!ctl.card._resizeBound) {
         window.addEventListener("resize", () => {
             // 窗口缩放时重绘所有已注册的页（仅当前可见页会实际绘制）
-            Object.values(ctl._pageRedraws).forEach(fn => fn());
+            Object.values(ctl._pageRedraws).forEach((fn) => fn());
         });
         ctl.card._resizeBound = true;
     }
@@ -813,12 +1032,18 @@ function wirePageCanvas(ctl, pageIdx) {
     });
 }
 
+/**
+ * 把 card 标为错误状态：head 标红，所有 page-slot 标 error，加错误条。
+ * @param {Object} ctl
+ * @param {string} msg
+ * @param {number} wallMs
+ */
 function markCardError(ctl, msg, wallMs) {
     ctl.card.dataset.status = "error";
     updateResultTab(ctl.seq, "error");
     // head: 标红
-    const status = ctl.head.querySelector('[data-role="status"]');
-    if (status) status.textContent = "失败";
+    const statusEl = ctl.head.querySelector('[data-role="status"]');
+    if (statusEl) statusEl.textContent = "失败";
     const big = ctl.head.querySelector('[data-role="server"]');
     if (big) {
         big.classList.remove("processing");
@@ -850,6 +1075,46 @@ function markCardError(ctl, msg, wallMs) {
     ctl.card.appendChild(errBar);
 }
 
+/**
+ * 把 card 标为取消状态：跟 markCardError 同构，但不带错误条，big timing 文字是"取消"。
+ * @param {Object} ctl
+ * @param {QueueItem} item
+ * @param {number} wallMs
+ */
+function markCardCancelled(ctl, item, wallMs) {
+    ctl.card.dataset.status = "cancelled";
+    updateResultTab(ctl.seq, "cancelled");
+    const statusEl = ctl.head.querySelector('[data-role="status"]');
+    if (statusEl) statusEl.textContent = "已取消";
+    const big = ctl.head.querySelector('[data-role="server"]');
+    if (big) {
+        big.classList.remove("processing", "error");
+        big.classList.add("cancelled");
+        big.textContent = "取消";
+    }
+    const wallEl = ctl.head.querySelector('[data-role="wall"]');
+    if (wallEl) wallEl.textContent = `${(wallMs / 1000).toFixed(2)}s`;
+    ctl.pageSlots.forEach((slot, i) => {
+        slot.dataset.status = "cancelled";
+        if (ctl.chips) {
+            const chip = ctl.chips.querySelector(`.page-chip[data-page-index="${i}"]`);
+            if (chip) {
+                chip.classList.remove("processing", "done", "error");
+                chip.classList.add("cancelled");
+            }
+        }
+    });
+}
+
+/**
+ * 命中测试：判断鼠标点击在哪个 region 的框内。从后往前遍历（后绘制的在上层）。
+ * @param {MouseEvent} e
+ * @param {HTMLCanvasElement} canvas
+ * @param {Array} regionData
+ * @param {number} srcW - 原图宽
+ * @param {number} srcH - 原图高
+ * @returns {number} 命中的 region 索引，-1 表示未命中
+ */
 function hitTestBox(e, canvas, regionData, srcW, srcH) {
     const r = canvas.getBoundingClientRect();
     const sx = r.width / srcW, sy = r.height / srcH;
@@ -864,6 +1129,16 @@ function hitTestBox(e, canvas, regionData, srcW, srcH) {
     return -1;
 }
 
+/**
+ * 在 canvas 上绘制所有 region 框。highlightIdx 对应的框高亮（加粗 + 半透明填充 + 标签）。
+ * @param {CanvasRenderingContext2D} ctx
+ * @param {Array} regions
+ * @param {number} srcW
+ * @param {number} srcH
+ * @param {number} dstW
+ * @param {number} dstH
+ * @param {number} highlightIdx
+ */
 function drawBoxes(ctx, regions, srcW, srcH, dstW, dstH, highlightIdx) {
     ctx.clearRect(0, 0, dstW, dstH);
     const sx = dstW / srcW, sy = dstH / srcH;
@@ -906,16 +1181,12 @@ function drawBoxes(ctx, regions, srcW, srcH, dstW, dstH, highlightIdx) {
     });
 }
 
-function escapeHtml(s) {
-    return String(s ?? "").replace(/[&<>"']/g, c =>
-        ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
-}
-
-function escapeAttr(s) {
-    return String(s ?? "").replace(/"/g, "&quot;");
-}
-
 // ===== 多结果导航 (result-switcher) =====
+/**
+ * 在 result-switcher 顶部加一个 tab，最新添加的默认 active。
+ * @param {number} seq
+ * @param {QueueItem} item
+ */
 function addResultTab(seq, item) {
     const tab = document.createElement("div");
     tab.className = "rs-tab active";  // 最新添加的默认 active
@@ -927,44 +1198,53 @@ function addResultTab(seq, item) {
     } else if (item.fileUrl) {
         thumbSrc = item.fileUrl;
     }
-    const statusText = {pending: "待处理", processing: "处理中", done: "完成", error: "失败"}[item.status] || "处理中";
+    const statusText = QUEUE_STATUS_LABEL[item.status] || "处理中";
     tab.innerHTML = `
     ${thumbSrc ? `<img class="rs-tab-thumb" src="${escapeAttr(thumbSrc)}" alt="" />` : `<div class="rs-tab-thumb" style="display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--fg-dim);">${item.isPdf ? "PDF" : "IMG"}</div>`}
     <div class="rs-tab-text">
       <div class="rs-tab-num">#${seq}</div>
       <div class="rs-tab-name" title="${escapeAttr(item.file.name)}">${escapeHtml(item.file.name)}</div>
     </div>
-    <span class="rs-tab-status ${item.status}">${statusText}</span>
+    <span class="rs-tab-status ${escapeAttr(item.status)}">${escapeHtml(statusText)}</span>
   `;
     tab.addEventListener("click", () => scrollToResult(seq));
     // 取消之前的 active（最新加的在最前）
-    rsTabs.querySelectorAll(".rs-tab.active").forEach(t => t.classList.remove("active"));
+    rsTabs.querySelectorAll(".rs-tab.active").forEach((t) => t.classList.remove("active"));
     rsTabs.appendChild(tab);
     updateResultSwitcherNav();
     // 滚动 tabs 到可见
     tab.scrollIntoView({behavior: "smooth", block: "nearest", inline: "nearest"});
 }
 
+/**
+ * 更新某个 tab 的状态徽标。
+ * @param {number} seq
+ * @param {string} status - processing | done | error | cancelled
+ */
 function updateResultTab(seq, status) {
     const tab = rsTabs.querySelector(`.rs-tab[data-seq="${seq}"]`);
     if (!tab) return;
     const statusEl = tab.querySelector(".rs-tab-status");
     if (statusEl) {
-        statusEl.classList.remove("processing", "done", "error");
+        statusEl.classList.remove("processing", "done", "error", "cancelled");
         statusEl.classList.add(status);
-        statusEl.textContent = {processing: "处理中", done: "完成", error: "失败"}[status] || status;
+        statusEl.textContent = QUEUE_STATUS_LABEL[status] || status;
     }
 }
 
 function updateResultSwitcherNav() {
     const all = Array.from(resultList.children);
     const n = all.length;
-    rs.classList.toggle("show", n > 0);
+    resultSwitcher.classList.toggle("show", n > 0);
     rsInfo.textContent = `${n} / ${n}`;
     rsPrev.disabled = true;  // scrollToResult 用 scrollIntoView, prev/next 暂简化
     rsNext.disabled = true;
 }
 
+/**
+ * 滚动到指定 seq 的结果卡，并高亮闪烁。
+ * @param {number} seq
+ */
 function scrollToResult(seq) {
     const card = resultList.querySelector(`.result-card[data-seq="${seq}"]`);
     if (!card) return;
@@ -978,27 +1258,27 @@ function scrollToResult(seq) {
     card.classList.add("scroll-target");
     setTimeout(() => card.classList.remove("scroll-target"), 1500);
     // 更新 active 状态
-    rsTabs.querySelectorAll(".rs-tab").forEach(t => t.classList.toggle("active", Number(t.dataset.seq) === seq));
+    rsTabs.querySelectorAll(".rs-tab").forEach((t) => t.classList.toggle("active", Number(t.dataset.seq) === seq));
 }
 
 rsPrev.addEventListener("click", () => {
     const all = Array.from(resultList.children);
     const cur = rsTabs.querySelector(".rs-tab.active");
     if (!cur || all.length === 0) return;
-    const curIdx = all.findIndex(c => Number(c.dataset.seq) === Number(cur.dataset.seq));
+    const curIdx = all.findIndex((c) => Number(c.dataset.seq) === Number(cur.dataset.seq));
     if (curIdx > 0) scrollToResult(Number(all[curIdx - 1].dataset.seq));
 });
 rsNext.addEventListener("click", () => {
     const all = Array.from(resultList.children);
     const cur = rsTabs.querySelector(".rs-tab.active");
     if (!cur || all.length === 0) return;
-    const curIdx = all.findIndex(c => Number(c.dataset.seq) === Number(cur.dataset.seq));
+    const curIdx = all.findIndex((c) => Number(c.dataset.seq) === Number(cur.dataset.seq));
     if (curIdx < all.length - 1) scrollToResult(Number(all[curIdx + 1].dataset.seq));
 });
 
 function clearAllResultTabs() {
     rsTabs.innerHTML = "";
-    rs.classList.remove("show");
+    resultSwitcher.classList.remove("show");
     rsInfo.textContent = "0 / 0";
 }
 
@@ -1012,9 +1292,9 @@ function updateClearResultsBtn() {
 }
 
 clearResultsBtn.addEventListener("click", () => {
-    resultList.querySelectorAll("img[src^='blob:']").forEach(img => URL.revokeObjectURL(img.src));
+    resultList.querySelectorAll("img[src^='blob:']").forEach((img) => URL.revokeObjectURL(img.src));
     resultList.innerHTML = "";
-    empty.style.display = "";
+    emptyState.style.display = "";
     clearAllResultTabs();
     updateClearResultsBtn();
 });

@@ -1,8 +1,17 @@
 <!doctype html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
     <meta charset="utf-8"/>
     <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <meta name="description"
+          content="Wise-Paddle OCR Playground — 基于 PP-DocLayoutV3 + PaddleOCR-VL 的在线 OCR 工具，支持图片和 PDF。"/>
+    <meta name="color-scheme" content="dark"/>
+    <!--
+        CSP: 限制脚本/样式/图片/连接来源，降低 XSS 注入面。
+        pdf.js 从 jsdelivr CDN 加载，connect-src 允许 https 和 self（fetch API）。
+        img-src 允许 data: （base64 图片）和 blob: （ObjectURL）。
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'"/>
     <title>Wise-Paddle · OCR Playground</title>
     <style>
         :root {
@@ -217,6 +226,20 @@
         .queue-item .badge.error {
             background: var(--danger);
             color: #fff;
+        }
+
+        .queue-item .badge.cancelled {
+            background: var(--fg-dim);
+            color: var(--bg);
+            opacity: 0.85;
+        }
+
+        .queue-item.cancelled {
+            opacity: 0.6;
+        }
+
+        .queue-item.cancelled::after {
+            display: none;
         }
 
         .queue-item .pages-tag {
@@ -713,6 +736,22 @@
             font-size: 13px;
         }
 
+        /* 队列状态文字（原 inline style） */
+        .queue-status-text {
+            font-size: 12px;
+            color: var(--fg-dim);
+            margin-left: auto;
+        }
+
+        /* 清空结果按钮的容器（原 inline style） */
+        .clear-results-bar {
+            display: flex;
+            justify-content: flex-end;
+            padding: 0 20px 16px;
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+
         /* Result switcher (sticky 顶部横条, 多结果卡片导航) */
         .result-switcher {
             position: sticky;
@@ -924,12 +963,19 @@
         }
     </style>
     <!-- PDF.js (legacy UMD build for inline <script> use) -->
-    <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.min.js"></script>
+    <!-- 加载失败时降级：app.js 内部用 if (window.pdfjsLib) 检测，PDF 预览走错误提示 -->
+    <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/legacy/build/pdf.min.js"
+            onerror="console.warn('[Wise-Paddle] PDF.js CDN load failed; PDF preview will be disabled.')"></script>
 </head>
 <body>
+<noscript>
+    <div style="padding:24px;text-align:center;color:#e6edf3;background:#0e1116;font-family:sans-serif;">
+        Wise-Paddle 需要 JavaScript 才能运行。请在浏览器设置中启用 JavaScript。
+    </div>
+</noscript>
 <header>
-    <h1><span class="logo"></span> Wise-Paddle · OCR Playground</h1>
-    <div class="stats">
+    <h1><span class="logo" aria-hidden="true"></span> Wise-Paddle · OCR Playground</h1>
+    <div class="stats" role="status" aria-live="polite" aria-label="服务状态">
         <span>pool <b id="stat-pool">–</b></span>
         <span>pending <b id="stat-pending">–</b></span>
         <span>batch <b id="stat-batch">–</b></span>
@@ -938,8 +984,9 @@
 
 <main>
     <div class="card">
-        <label class="drop-zone" id="drop-zone">
-            <input type="file" id="file-input" accept="image/*,application/pdf" multiple/>
+        <label class="drop-zone" id="drop-zone" aria-label="上传图片或 PDF 文件">
+            <input type="file" id="file-input" accept="image/*,application/pdf" multiple
+                   aria-label="选择文件"/>
             <div>把图片 / PDF 拖到这里，或者 <strong>点我选择</strong></div>
             <div class="hint">支持 PNG / JPG / WebP / PDF</div>
         </label>
@@ -950,16 +997,16 @@
             <div class="actions">
                 <button class="btn" id="start-btn" disabled>开始处理</button>
                 <button class="btn ghost" id="clear-queue-btn">清空队列</button>
-                <span style="font-size:12px;color:var(--fg-dim);margin-left:auto;" id="queue-status"></span>
+                <span class="queue-status-text" id="queue-status"></span>
             </div>
         </div>
     </div>
 
-    <div class="result-switcher" id="result-switcher">
+    <div class="result-switcher" id="result-switcher" role="navigation" aria-label="结果导航">
         <span class="rs-label">结果</span>
-        <button class="rs-btn" id="rs-prev" disabled>‹</button>
+        <button class="rs-btn" id="rs-prev" disabled aria-label="上一个结果">‹</button>
         <div class="rs-tabs" id="rs-tabs"></div>
-        <button class="rs-btn" id="rs-next" disabled>›</button>
+        <button class="rs-btn" id="rs-next" disabled aria-label="下一个结果">›</button>
         <span class="rs-info" id="rs-info">0 / 0</span>
     </div>
 
@@ -967,11 +1014,11 @@
     <div id="empty" class="empty-state">还没有结果。先在左边加文件，点"开始处理"。</div>
 </main>
 
-<div style="display:flex;justify-content:flex-end;padding:0 20px 16px;max-width:1100px;margin:0 auto;">
+<div class="clear-results-bar">
     <button class="btn ghost" id="clear-results-btn" style="display:none;">清空结果</button>
 </div>
 
-<div class="toast" id="toast">已复制</div>
+<div class="toast" id="toast" role="status" aria-live="polite">已复制</div>
 
 <script src="app.js"></script>
 </body>

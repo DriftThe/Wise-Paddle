@@ -9,3 +9,9 @@ model
 text_result
 
 logs
+
+.env
+
+server.log
+
+__pycache__/
