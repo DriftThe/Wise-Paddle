@@ -1190,20 +1190,26 @@ class BatchScheduler:
             cancelled_count += user_cancelled
         if cancelled_count:
             self._pending_count = max(0, self._pending_count - cancelled_count)
+        # 取消路径会让用户立刻变成"闲置"，这里顺带清一次（H-05）
+        self._prune_idle_users(time.monotonic())
         return cancelled_count
 
     def _prune_idle_users(self, now: float) -> None:
         """清理闲置用户书签，防止 _user_order / _user_completed 无限增长（H-05）。
 
-        调用者必须持有 ``self._lock``。仅清理"队列已空 + 超过空闲窗口"的用户；
-        有 pending 或刚活动过的用户不受影响。
+        调用者必须持有 ``self._lock``。仅清理"无 pending 队列 + 超过空闲窗口"的
+        用户；有 pending、在飞任务或刚活动过的用户不受影响（在飞任务完成时会
+        重新写回 _user_completed / _user_last_active）。
         """
-        for u in list(self._user_pending.keys()):
-            if self._user_pending[u]:
+        # 注意：_user_pending 的 key 恒对应非空队列（空队列在 _take_fair_batch /
+        # _cancel_in_pending 里已删 key），真正无限增长的是 _user_order /
+        # _user_completed —— 必须遍历 _user_order 才能清理到它们。
+        active = set(self._user_pending.keys())
+        for u in list(self._user_order):
+            if u in active:
                 continue
             last = self._user_last_active.get(u)
             if last is not None and now - last > _USER_IDLE_PRUNE_S:
-                del self._user_pending[u]
                 self._user_completed.pop(u, None)
                 self._user_last_active.pop(u, None)
                 if u in self._user_order:
@@ -1320,6 +1326,11 @@ class BatchScheduler:
                     picked_any = True
                     if len(result) >= max_n:
                         break
+
+        # 刚被取走的 job 视为"在飞"：刷新活跃时间，避免长任务处理期间被误清理
+        now = time.monotonic()
+        for job in result:
+            self._user_last_active[job.request_id] = now
 
         # 清理空 user 队列（保留 _user_order 顺序历史）
         for u in list(self._user_pending.keys()):

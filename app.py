@@ -36,6 +36,7 @@ import asyncio
 import base64
 import io
 import logging
+import math
 import os
 import re
 import shutil
@@ -560,11 +561,15 @@ def _sanitize_user_id(value: Optional[str]) -> str:
 def _safe_filename(name: Optional[str]) -> str:
     """日志安全：转义文件名中的控制字符，防日志注入（L-05）。"""
     name = name or "<unnamed>"
-    return name.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return re.sub(
+        r"[\x00-\x1f\x7f]",
+        lambda m: f"\\x{ord(m.group()):02x}",
+        name,
+    )
 
 
 def _check_pixel_budget(width: int, height: int) -> None:
-    """解码后像素预算检查，防解压炸弹（H-03）。"""
+    """像素预算检查（解码前用头部尺寸 / 解码后用实际尺寸），防解压炸弹（H-03）。"""
     if width <= 0 or height <= 0:
         raise HTTPException(status_code=400, detail="图片尺寸无效")
     if width * height > CFG.max_image_pixels:
@@ -588,12 +593,27 @@ def _decode_raw_image(raw: bytes) -> np.ndarray:
     """把图片字节解码为 RGB ndarray，优先走 PIL 以处理 EXIF 方向（L-13），失败回退 cv2。"""
     try:
         with PILImage.open(io.BytesIO(raw)) as pil_img:
+            # 解码前先用头部尺寸拦截超大图，防解压炸弹（H-03）；
+            # EXIF 旋转只交换宽高，乘积不变，可直接用头部尺寸判断。
+            _check_pixel_budget(pil_img.width, pil_img.height)
             transposed = ImageOps.exif_transpose(pil_img)
             transposed.load()
         return np.asarray(transposed.convert("RGB"))
+    except HTTPException:
+        raise  # 预算/尺寸错误直接透传，避免回退 cv2 绕过像素上限
+    except PILImage.DecompressionBombError:
+        # PIL 在 open() 阶段就会拒绝超巨尺寸（> ~1.79 亿像素），
+        # 同样转为 413，不能回退 cv2（cv2 无此限制，会完整解码）
+        raise HTTPException(
+            status_code=413,
+            detail=f"图片像素数超过 {CFG.max_image_pixels // 1_000_000}MP 限制",
+        )
     except Exception:
         arr = np.frombuffer(raw, np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        try:
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        except Exception:
+            img = None
         if img is None:
             raise ValueError("无法解码图片")
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -662,6 +682,16 @@ def _decode_pdf_to_pil_pages(
             raise ValueError("PDF 已加密，需要密码才能打开")
         for page_num in range(len(pdf)):
             page = pdf[page_num]
+            if max_pixels is not None:
+                # 渲染前按 page.rect × zoom 估算像素数，超大页直接拒绝，
+                # 避免整页先光栅化再丢弃（与 H-02 先检查后渲染同思路）
+                rect = page.rect
+                est_w = int(math.ceil(rect.width * zoom))
+                est_h = int(math.ceil(rect.height * zoom))
+                if est_w * est_h > max_pixels:
+                    raise ValueError(
+                        f"PDF 第 {page_num + 1} 页像素数超过上限"
+                    )
             pix = page.get_pixmap(matrix=mat, alpha=False)
             if max_pixels is not None and pix.width * pix.height > max_pixels:
                 raise ValueError(
