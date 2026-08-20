@@ -180,6 +180,7 @@ class Job:
     image: Image.Image
     fut: "asyncio.Future[PageResult]" = field(default=None)  # type: ignore[type-arg]
     voucher_id: str = ""
+    generation: int = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -776,7 +777,7 @@ class OCRPipeline:
             self,
             jobs: list[Job],
             cancelled_vouchers: Optional[set[str]] = None,
-            cancelled_requests: Optional[set[str]] = None,
+            cancelled_requests: Optional[dict[str, int]] = None,
     ) -> list[PageResult]:
         """一次处理 N 张图（跨用户共享 layout + VL 推理）。
 
@@ -787,7 +788,7 @@ class OCRPipeline:
         3. 跨图按 label 分桶 → VL batch（跨用户共享 GPU）
         4. markdown 落盘到各自 request_id/ 子目录，返回 PageResult
 
-        两层取消过滤（合并 ``cancelled_vouchers`` 和 ``cancelled_requests``）：
+        取消过滤（合并 ``cancelled_vouchers`` 和 ``cancelled_requests``）：
 
         - 入口（防御 take_batch 后才 cancel 的情况）
         - crop 之后、VL 之前（处理 "layout 完成了但还没 VL" 的 crops）
@@ -799,14 +800,13 @@ class OCRPipeline:
         if cancelled_vouchers is None:
             cancelled_vouchers = set()
         if cancelled_requests is None:
-            cancelled_requests = set()
+            cancelled_requests = {}
 
         def _is_cancelled(j: "Job") -> bool:
             if j.voucher_id and j.voucher_id in cancelled_vouchers:
                 return True
-            if j.request_id and j.request_id in cancelled_requests:
-                return True
-            return False
+            gen = cancelled_requests.get(j.request_id) if cancelled_requests else None
+            return gen is not None and j.generation <= gen
 
         st = time.perf_counter()
         self._ensure_output_dir()
@@ -820,23 +820,18 @@ class OCRPipeline:
                 )
 
         n = len(jobs)
-
-        # --- 第 1 次过滤：入口 --- 拒掉 voucher / request 已取消的
-        # 保留原 jobs 列表的索引位置，结果按原顺序回填
-        active1_idx: list[int] = [
-            i for i, j in enumerate(jobs) if not _is_cancelled(j)
-        ]
-        if not active1_idx:
+        # --- 第 1 次过滤：入口 --- 拒掉 voucher / request 已取消的 job
+        active = [(i, j) for i, j in enumerate(jobs) if not _is_cancelled(j)]
+        if not active:
             return [self._empty_page_result(j) for j in jobs]
 
-        active1_jobs = [jobs[i] for i in active1_idx]
-
         # 1) layout detection 整批一次
-        images_rgb: list[Image.Image] = [j.image.convert("RGB") for j in active1_jobs]
+        active_jobs = [j for _, j in active]
+        images_rgb: list[Image.Image] = [j.image.convert("RGB") for j in active_jobs]
         layouts_per_page = self.layout.detect(images_rgb)
 
         # 2) 每图独立 filter + crop（page_size 让 unclip clamp 到图内）
-        crops_per_page: list[list[tuple[Image.Image, LayoutBox]]] = [
+        crops_per_page = [
             self._crop_page(image, layouts)
             for image, layouts in zip(images_rgb, layouts_per_page)
         ]
@@ -844,54 +839,36 @@ class OCRPipeline:
         # --- 第 2 次过滤：crop 之后、VL 之前 ---
         # cancel_voucher / cancel_request 在 process_batch 运行期间被另一个线程
         # （GIL 切换）调时，这次过滤能捕到（在 entry 和 crop 之间发生了 cancel）
-        active2_idx_in_a1: list[int] = [
-            i for i, j in enumerate(active1_jobs) if not _is_cancelled(j)
+        active2 = [
+            (orig_idx, job, image, crops)
+            for (orig_idx, job), image, crops in zip(active, images_rgb, crops_per_page)
+            if not _is_cancelled(job)
         ]
-        if not active2_idx_in_a1:
-            # 全部被第 2 次过滤掉
-            results: list[Optional[PageResult]] = [None] * n
-            for ai, j in enumerate(active1_jobs):
-                results[active1_idx[ai]] = self._empty_page_result(j)
-            for idx in range(n):
-                if results[idx] is None:
-                    results[idx] = self._empty_page_result(jobs[idx])
-            return results  # type: ignore[return-value]
 
-        # 缩到 active2 的子集
-        active2_jobs = [active1_jobs[i] for i in active2_idx_in_a1]
-        active2_in_orig_idx = [active1_idx[i] for i in active2_idx_in_a1]
-        crops2_per_page = [crops_per_page[i] for i in active2_idx_in_a1]
-        images2_rgb = [images_rgb[i] for i in active2_idx_in_a1]
-
-        # 3) 跨图按 label 桶聚合（同一个 bucket 一次 VL forward）
-        md_lookup = self._run_vl_buckets(crops2_per_page)
-
-        # 4) 写文件 + 构造 active2 的 PageResult
-        active2_results: list[PageResult] = []
-        for p_idx, (job, crops) in enumerate(zip(active2_jobs, crops2_per_page)):
-            image = images2_rgb[p_idx]
-            req_dir = self._safe_request_dir(job.request_id)
-            regions = self._write_regions(
-                req_dir, job.page_index, crops, md_lookup, p_idx
-            )
-            active2_results.append(
-                PageResult(
+        results: list[Optional[PageResult]] = [None] * n
+        if active2:
+            # 3) 跨图按 label 桶聚合（同一个 bucket 一次 VL forward）
+            md_lookup = self._run_vl_buckets([c for _, _, _, c in active2])
+            # 4) 写文件 + 构造 active2 的 PageResult
+            for off, (orig_idx, job, image, crops) in enumerate(active2):
+                req_dir = self._safe_request_dir(job.request_id)
+                regions = self._write_regions(
+                    req_dir, job.page_index, crops, md_lookup, off
+                )
+                results[orig_idx] = PageResult(
                     page_index=job.page_index,
                     width=image.width,
                     height=image.height,
                     elapsed_seconds=time.perf_counter() - st,  # 本页完成时刻的墙钟耗时（L-09）
                     regions=regions,
                 )
-            )
 
-        # 回填到原 jobs 顺序：active2 的塞回原位置，缺口（被第 1 次过滤的）填空
-        results2: list[Optional[PageResult]] = [None] * n
-        for ai2, pr in enumerate(active2_results):
-            results2[active2_in_orig_idx[ai2]] = pr
-        for idx in range(n):
-            if results2[idx] is None:
-                results2[idx] = self._empty_page_result(jobs[idx])
-        return results2  # type: ignore[return-value]
+        # 回填到原 jobs 顺序：缺口（被第 1/2 次过滤的）填空
+        final: list[PageResult] = []
+        for idx, job in enumerate(jobs):
+            r = results[idx]
+            final.append(r if r is not None else self._empty_page_result(job))
+        return final
 
     def _run_vl_buckets(
             self,
@@ -942,7 +919,20 @@ class PipelinePool:
         logger.info("Pipeline pool ready")
 
     async def close(self) -> None:
-        # 当前实现里 pipeline 不持有需要显式释放的资源；保留接口以便扩展
+        # 归还所有未被租借的 pipeline 并释放其模型引用（NEW-05）。
+        # 正常情况下 shutdown 时 worker 已被取消、pipeline 都已归还到队列；
+        # 循环取空是防御性处理（万一有异常路径泄漏了租借）。
+        while True:
+            try:
+                pipe = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                del pipe  # 释放模型权重引用（LayoutDetector / VLPredictor 的 torch 模块）
+            except Exception:
+                pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         logger.info("Pipeline pool closed")
 
     def qsize(self) -> int:
@@ -1029,7 +1019,8 @@ class BatchScheduler:
         # request 取消追踪：同上，但按 request_id（也就是 user_id / 单次 upload）。
         # 跟 voucher 取消是两套独立维度 —— 前者是"用户离线全部清"，后者是"前端点
         # remove 只清这一条"。同时在两层过滤里 union 取并集。
-        self._cancelled_requests: set[str] = set()
+        self._cancelled_requests: dict[str, int] = {}
+        self._request_generations: dict[str, int] = {}
 
     async def start(self) -> None:
         logger.info(
@@ -1056,12 +1047,25 @@ class BatchScheduler:
         await self._cancel_all_pending("scheduler closed")
         logger.info("BatchScheduler closed")
 
+    def next_request_generation(self, request_id: str) -> int:
+        """为一次新的上传申请一个新的 request 代数。
+
+        每次上传（即使复用同一个 user_id）都应调用一次；返回的 generation
+        传给该批所有 ``submit``。取消标记只影响旧代数，因此新上传不会被旧取消
+        标记误伤。
+        """
+        gen = self._request_generations.get(request_id, 0) + 1
+        self._request_generations[request_id] = gen
+        return gen
+
+
     def submit(
             self,
             request_id: str,
             page_index: int,
             image: Image.Image,
             voucher_id: str = "",
+            generation: Optional[int] = None,
     ) -> Job:
         """提交一个 page 任务，返回 Job（``Job.fut`` 是 ``asyncio.Future[PageResult]``）。
 
@@ -1072,6 +1076,10 @@ class BatchScheduler:
 
         必须在 event loop 线程内调用（因为要创建 Future）。
         """
+        if generation is None:
+            generation = self._request_generations.get(request_id, 1)
+            self._request_generations[request_id] = generation
+
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[PageResult] = loop.create_future()
         job = Job(
@@ -1080,6 +1088,7 @@ class BatchScheduler:
             image=image,
             fut=fut,
             voucher_id=voucher_id,
+            generation=generation,
         )
         # 放进 per-user 队列（首次出现的 user 加进 _user_order）
         if request_id not in self._user_pending:
@@ -1129,6 +1138,29 @@ class BatchScheduler:
             )
         return cancelled_count
 
+    async def revive_voucher(self, voucher_id: str) -> int:
+        """把已取消的 voucher 从取消追踪集合里移除（NEW-01 复活语义）。
+
+        场景：voucher 因倒计时归零被 ``cancel_voucher`` 标记取消后，前端回到前台
+        再次 ``/alive`` 续期——此时该 voucher 应当"复活"，否则它名下所有后续上传
+        都会被 ``process_batch`` 第一层过滤静默取消（表现为每次任务都莫名 cancelled）。
+
+        返回被移除的取消标记数（0 = 该 voucher 本来就没被标记，幂等安全）。
+        """
+        if not voucher_id:
+            return 0
+        removed = 0
+        async with self._lock:
+            if voucher_id in self._cancelled_vouchers:
+                self._cancelled_vouchers.discard(voucher_id)
+                removed = 1
+        if removed:
+            logger.info(
+                "scheduler revived voucher=%s (removed from cancelled tracking)",
+                voucher_id,
+            )
+        return removed
+
     async def cancel_request(self, request_id: str) -> int:
         """一次性取消 request_id 的所有 pending + in-flight 工作。
 
@@ -1145,7 +1177,10 @@ class BatchScheduler:
                 lambda job: job.request_id == request_id
             )
             # 标记 request 已取消（worker 下一批 process_batch 入口 + crop 之后会看到）
-            self._cancelled_requests.add(request_id)
+            gen = self._request_generations.get(request_id, 0)
+            self._cancelled_requests[request_id] = max(
+                self._cancelled_requests.get(request_id, 0), gen
+            )
             self._maybe_gc_cancelled_tracking()
         self._wakeup.set()
         if cancelled_count:
@@ -1161,6 +1196,57 @@ class BatchScheduler:
                 request_id,
             )
         return cancelled_count
+
+    async def cancel_jobs(self, jobs: Sequence[Job]) -> int:
+        """精确取消并移除一组 Job（即使 fut 已处于 cancelled/done 状态）。
+
+        用于重复上传/后台任务取消：直接 ``fut.cancel()`` 不会把 Job 从
+        ``_user_pending`` 队列移除，worker 仍可能取出并执行完整 OCR。此方法
+        按对象身份从队列删除，并把涉及的 request 代数写入取消追踪，保证
+        in-flight 的旧代数任务也能被 process_batch 过滤。
+
+        返回移除/取消的 Job 数。不会影响同一 request_id 的新代数任务。
+        """
+        if not jobs:
+            return 0
+        target_ids = {id(j) for j in jobs}
+        cancelled_count = 0
+        gen_by_req: dict[str, int] = {}
+        async with self._lock:
+            for u, q in list(self._user_pending.items()):
+                kept: list[Job] = []
+                while q:
+                    job = q.popleft()
+                    if id(job) in target_ids:
+                        if not job.fut.done():
+                            job.fut.cancel("cancelled by scheduler")
+                        cancelled_count += 1
+                        gen_by_req[job.request_id] = max(
+                            gen_by_req.get(job.request_id, 0),
+                            job.generation,
+                        )
+                    else:
+                        kept.append(job)
+                for j in reversed(kept):
+                    q.appendleft(j)
+                if not q:
+                    self._user_pending.pop(u, None)
+            if cancelled_count:
+                self._pending_count = max(0, self._pending_count - cancelled_count)
+            # 让 in-flight 的旧代数任务也在 process_batch 过滤中命中
+            for req, gen in gen_by_req.items():
+                self._cancelled_requests[req] = max(
+                    self._cancelled_requests.get(req, 0), gen
+                )
+            self._prune_idle_users(time.monotonic())
+        if cancelled_count:
+            self._wakeup.set()
+            logger.info(
+                "scheduler cancelled %d exact job(s); request_generations=%s",
+                cancelled_count, gen_by_req,
+            )
+        return cancelled_count
+
 
     def pending_size(self) -> int:
         return self._pending_count
@@ -1212,6 +1298,8 @@ class BatchScheduler:
             if last is not None and now - last > _USER_IDLE_PRUNE_S:
                 self._user_completed.pop(u, None)
                 self._user_last_active.pop(u, None)
+                self._request_generations.pop(u, None)
+                self._cancelled_requests.pop(u, None)
                 if u in self._user_order:
                     self._user_order.remove(u)
                 logger.info("scheduler pruned idle user=%s", u)
@@ -1240,7 +1328,7 @@ class BatchScheduler:
         # longer active. Voucher-level cancellations are kept as-is (they may
         # be shared across many requests and we can't tell which are stale).
         self._cancelled_requests = {
-            r for r in self._cancelled_requests if r in active_users
+            r: g for r, g in self._cancelled_requests.items() if r in active_users
         }
         gc_r = before_r - len(self._cancelled_requests)
         if gc_r:
@@ -1405,6 +1493,7 @@ class BatchScheduler:
             user_in_batch_count[j.request_id] = user_in_batch_count.get(j.request_id, 0) + 1
 
         results: Optional[list[PageResult]] = None
+        process_exc: Optional[BaseException] = None
         try:
             async with self.pool.lease() as pipe:
                 wait = time.perf_counter() - t0
@@ -1415,15 +1504,32 @@ class BatchScheduler:
                     len(batch), len(users_in_batch), users_in_batch,
                     user_in_batch_count,
                 )
-                # 把 _cancelled_vouchers + _cancelled_requests 都传给
-                # pipeline.process_batch，让 entry + crop 之后两层过滤掉
-                # voucher / request 已取消的 job
-                results = await run_in_threadpool(
-                    pipe.process_batch, batch,
-                    self._cancelled_vouchers, self._cancelled_requests,
+                # Pass cancellation sets/dicts so process_batch can filter.
+                batch_task = asyncio.create_task(
+                    run_in_threadpool(
+                        pipe.process_batch, batch,
+                        self._cancelled_vouchers, self._cancelled_requests,
+                    )
                 )
+                try:
+                    results = await asyncio.shield(batch_task)
+                except asyncio.CancelledError:
+                    # Do not release the pipeline until the background thread
+                    # has actually finished using it.
+                    try:
+                        results = await batch_task
+                    except Exception as exc:
+                        process_exc = exc
+                    raise
+        except asyncio.CancelledError:
+            # Worker is being cancelled; fail jobs so callers do not hang.
+            exc = process_exc if process_exc is not None else asyncio.CancelledError()
+            for job in batch:
+                if not job.fut.done():
+                    job.fut.set_exception(exc)
+            raise
         except Exception as exc:
-            # process_batch 抛了：把异常传给每个 job，不让 worker 死掉
+            # process_batch threw: propagate to each job and keep worker alive.
             logger.exception(
                 "scheduler[%d] process_batch crashed: %s", wid, exc,
             )
@@ -1431,7 +1537,6 @@ class BatchScheduler:
                 if not job.fut.done():
                     job.fut.set_exception(exc)
             return
-
         dt = time.perf_counter() - t0
         # 5) 更新每个 user 的已完成数（用于下次 fair 排序）
         for u, c in user_in_batch_count.items():

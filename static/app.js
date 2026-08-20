@@ -416,8 +416,10 @@ const QUEUE_STATUS_LABEL = {
  */
 function handleCancelProcessingItem(btn, item) {
     // 1) 通知服务端 cancel（fire-and-forget，scheduler 那边会 cancel futs）
+    //    voucher_id 用于归属校验（M-04）
     if (item.userId) {
-        fetch(`/api/cancel/${encodeURIComponent(item.userId)}`, {method: "POST"})
+        const cancelQs = new URLSearchParams({voucher_id: aliveVoucher || ""});
+        fetch(`/api/cancel/${encodeURIComponent(item.userId)}?${cancelQs.toString()}`, {method: "POST"})
             .catch((err) => console.warn("[Wise-Paddle] cancel fetch error:", err));
     }
     // 2) 中断进行中的 fetch（单图同步路径会立刻抛 AbortError）
@@ -451,7 +453,8 @@ clearQueueBtn.addEventListener("click", () => {
         // 处理中的任务：先通知服务端取消，再中断 fetch / 轮询（M-11）
         if (q.status === "processing") {
             if (q.userId) {
-                fetch(`/api/cancel/${encodeURIComponent(q.userId)}`, {method: "POST"})
+                const cancelQs = new URLSearchParams({voucher_id: aliveVoucher || ""});
+                fetch(`/api/cancel/${encodeURIComponent(q.userId)}?${cancelQs.toString()}`, {method: "POST"})
                     .catch(() => {});
             }
             q.pollAbort = true;
@@ -540,7 +543,8 @@ async function processOne(item) {
         if (item.status === "cancelled" || item.pollAbort) return;
         // 超时 / 网络错误：通知服务端取消，避免 GPU 任务继续空转（M-11）
         if (item.userId) {
-            fetch(`/api/cancel/${encodeURIComponent(item.userId)}`, {method: "POST"})
+            const cancelQs = new URLSearchParams({voucher_id: aliveVoucher || ""});
+            fetch(`/api/cancel/${encodeURIComponent(item.userId)}?${cancelQs.toString()}`, {method: "POST"})
                 .catch(() => {});
         }
         item.status = "error";
@@ -597,7 +601,8 @@ async function pollPdfProgress(ctl, item, userId, initData, t0) {
                 }
             }
             const sep = pollUrl.includes("?") ? "&" : "?";
-            const r = await fetch(`${pollUrl}${sep}since=${since}`, {cache: "no-store"});
+            // voucher_id 用于归属校验（M-04）
+            const r = await fetch(`${pollUrl}${sep}since=${since}&voucher_id=${encodeURIComponent(aliveVoucher || "")}`, {cache: "no-store"});
             if (!r.ok) {
                 setTimeout(tick, PDF_POLL_INTERVAL_MS);
                 return;

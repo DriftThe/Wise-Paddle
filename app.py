@@ -1,12 +1,12 @@
 """
-Wise-Paddle uvicorn 服务（生产落地版：.env 驱动 + 显式 cleanup，零心跳）
+Wise-Paddle uvicorn 服务（生产落地版：.env 驱动 + 显式 cleanup + alive voucher 心跳）
 
 设计要点：
 - 单 pipeline 一次处理一批（最多 BATCH_MAX 张图）
 - BatchScheduler 跨用户聚合 page 任务送给 pipeline（max-min fair）
 - layout detection 和 VL 推理都能 batch 起来
 - 每个 request 唯一 user_id (request_id)，用于 per-user 输出子目录隔离
-- 用户在线/离线检测逻辑由调用方自行实现 —— 服务端不做自动取消
+- 用户在线/离线由 /alive 心跳维护，超时后服务端按 voucher 自动取消任务
 
 HTTP 接口：
 - GET  /                          —— 前端 UI（单页 HTML）
@@ -154,6 +154,7 @@ class Config:
     max_pdf_upload_mb: float = _env_float("MAX_PDF_UPLOAD_MB", 128.0)
     max_pdf_pages: int = _env_int("MAX_PDF_PAGES", 200)
     max_image_pixels: int = _env_int("MAX_IMAGE_PIXELS", 50_000_000)  # 解码后单图像素上限
+    max_response_pixels: int = _env_int("MAX_RESPONSE_PIXELS", 2_000_000)  # 响应展示图最长边像素上限（M-02）
     pdf_dpi: float = _env_float("PDF_DPI", 200.0)
 
     # ---- 日志 ----
@@ -281,6 +282,20 @@ _pdf_cleanup_task: Optional[asyncio.Task] = None
 _text_result_cleanup_task: Optional[asyncio.Task] = None
 _alive_check_task: Optional[asyncio.Task] = None
 _app_version = "0.6.0"
+
+# ─── voucher 归属映射（M-04）：request_id → 绑定的 voucher_id ──────
+# 提交任务时登记，/api/cancel 与 /api/ocr/pdf-status 校验携带的 voucher 归属，
+# 防止局域网内猜中 user_id 就取消/读取他人任务。带时间戳，由
+# _pdf_progress_cleanup_loop 按 _REQUEST_VOUCHER_TTL_S 过期清理（任务早已
+# 结束的条目校验放行，保持对旧客户端兼容）。
+_request_vouchers: dict[str, str] = {}
+_request_vouchers_ts: dict[str, float] = {}
+_request_vouchers_lock = asyncio.Lock()
+_REQUEST_VOUCHER_TTL_S = max(
+    1200,
+    CFG.pdf_progress_ttl_s + 600,
+    int(CFG.alive_initial_ttl * CFG.alive_tick_seconds) + 60,
+)  # 覆盖 PDF_PROGRESS_TTL_S 与 alive 保活窗口，避免映射先于任务数据过期
 
 # ─── 心跳：aliveUsers 由 _alive_lock 保护 ─────────────────────────
 # voucher -> 剩余 tick 数。每次 /alive 把 TTL 重置到 CFG.alive_initial_ttl；
@@ -499,7 +514,7 @@ class OCRPage(BaseModel):
     page_index: int
     width: int
     height: int
-    image_b64: str = Field(..., description="原图 PNG base64；前端直接画到 canvas")
+    image_b64: str = Field(..., description="展示图 PNG base64（已按 MAX_RESPONSE_PIXELS 缩放；width/height 仍为原图坐标）；前端直接画到 canvas")
 
 
 class OCRResponse(BaseModel):
@@ -543,6 +558,44 @@ def _check_content_length(request: Request, max_mb: float) -> None:
             )
 
 
+async def _read_upload_with_limit(file: UploadFile, max_mb: float) -> bytes:
+    """流式读取上传 body，超过 ``max_mb`` 立即 413（NEW-02）。
+
+    不依赖 Content-Length —— chunked / 无该头部的请求也会在读满上限时被截断，
+    避免 `await file.read()` 把任意大的 body 完整读进内存后再检查。
+    """
+    limit = int(max_mb * 1024 * 1024)
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1 << 20)  # 1 MiB 分块
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"上传文件超过 {max_mb:.0f}MB 限制",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+async def _read_body_with_limit(request: Request, max_bytes: int) -> bytes:
+    """流式读取请求 body 并限制大小，避免 JSON body 先整体进内存（M-02 补充）。"""
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=f"请求体超过 {max_bytes / (1024 * 1024):.0f}MB 限制",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+
 _USER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
@@ -557,6 +610,20 @@ def _sanitize_user_id(value: Optional[str]) -> str:
         )
     return value
 
+_VOUCHER_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _sanitize_voucher_id(value: str) -> str:
+    """校验 voucher_id 字符集与长度，防止超长/控制字符进入日志与内存（L-01 补充）。"""
+    value = value or ""
+    if value and not _VOUCHER_ID_RE.fullmatch(value):
+        raise HTTPException(
+            status_code=400,
+            detail="voucher_id 只允许字母 / 数字 / 下划线 / 连字符（1-128 字符）",
+        )
+    return value
+
+
 
 def _safe_filename(name: Optional[str]) -> str:
     """日志安全：转义文件名中的控制字符，防日志注入（L-05）。"""
@@ -566,6 +633,39 @@ def _safe_filename(name: Optional[str]) -> str:
         lambda m: f"\\x{ord(m.group()):02x}",
         name,
     )
+
+
+def _register_request_voucher(user_id: str, voucher_id: str) -> None:
+    """登记 request_id → voucher_id 归属（M-04）。提交任务时调用。"""
+    if not user_id:
+        return
+    _request_vouchers[user_id] = voucher_id
+    _request_vouchers_ts[user_id] = time.monotonic()
+
+
+async def _check_voucher_guard(user_id: str, voucher_id: str) -> None:
+    """取消 / 状态接口的 voucher 归属校验（M-04）。
+
+    只对**已登记**过 (user_id → voucher) 的记录强制校验：不匹配返回 403。
+    记录已过期（TTL 外）时放行 —— 此时任务早已结束，猜中 user_id 也无实际
+    危害，且保持对不带 voucher 的旧客户端兼容。
+    登记为空 voucher（""）的记录也强制 403 —— 空串不构成归属凭证，否则不带
+    voucher 的调用方靠猜 user_id 就能取消/读取他人任务。
+    """
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id 不能为空")
+    async with _request_vouchers_lock:
+        expected = _request_vouchers.get(user_id)
+        ts = _request_vouchers_ts.get(user_id)
+    if expected is None or ts is None:
+        return
+    if time.monotonic() - ts > _REQUEST_VOUCHER_TTL_S:
+        return
+    if not expected or expected != voucher_id:
+        raise HTTPException(
+            status_code=403,
+            detail="voucher_id 不匹配，无权操作该请求",
+        )
 
 
 def _check_pixel_budget(width: int, height: int) -> None:
@@ -645,6 +745,26 @@ def _pil_to_b64_png(pil_img: PILImage.Image) -> str:
         pil_img = pil_img.convert("RGB")
     pil_img.save(buf, format="PNG", optimize=False)
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _response_image(pil_img: PILImage.Image) -> PILImage.Image:
+    """响应展示图归一化：像素数超过 ``MAX_RESPONSE_PIXELS`` 时等比缩小（M-02）。
+
+    只影响返回给前端的展示图体积；OCR 页面 ``width/height`` 与 region ``rect``
+    仍使用原图坐标，前端画框映射基于这两个字段（`wrap.dataset.w/h`），与
+    image_b64 实际尺寸无关，因此缩放不会导致框错位。
+    """
+    max_px = CFG.max_response_pixels
+    if max_px <= 0:
+        return pil_img
+    w, h = pil_img.size
+    if w * h <= max_px:
+        return pil_img
+    scale = math.sqrt(max_px / (w * h))
+    return pil_img.resize(
+        (max(1, int(w * scale)), max(1, int(h * scale))),
+        PILImage.Resampling.LANCZOS,
+    )
 
 
 def _count_pdf_pages(raw: bytes) -> int:
@@ -748,6 +868,11 @@ async def _process_pages(
     if scheduler is None:
         raise HTTPException(status_code=503, detail="Scheduler 尚未初始化")
 
+    # 登记 user_id → voucher 归属，供 /api/cancel 与 /api/ocr/pdf-status 校验（M-04）
+    _register_request_voucher(request_id, voucher_id)
+    # 每次上传都申请新代数；即使复用 user_id，也不会被旧的 request 取消标记误伤
+    generation = scheduler.next_request_generation(request_id)
+
     submit_t = time.perf_counter()
     jobs: list[Job] = []
     for idx, pil_img in enumerate(pil_pages):
@@ -756,6 +881,7 @@ async def _process_pages(
         job = scheduler.submit(
             request_id=request_id, page_index=idx, image=pil_img,
             voucher_id=voucher_id,
+            generation=generation,
         )
         jobs.append(job)
 
@@ -786,8 +912,10 @@ async def _build_ocr_response_with_images(
     all_regions: list[OCRRegion] = []
     out_pages: list[OCRPage] = []
     for pil, pr in zip(pil_pages, page_results):
-        # PNG 编码是 CPU 密集操作，放线程池避免阻塞事件循环（M-02）
-        b64 = await run_in_threadpool(_pil_to_b64_png, pil)
+        # PNG 编码是 CPU 密集操作，放线程池避免阻塞事件循环（M-02）；
+        # 展示图先归一化（M-02），width/height 与 region rect 仍用原图坐标
+        display = await run_in_threadpool(_response_image, pil)
+        b64 = await run_in_threadpool(_pil_to_b64_png, display)
         out_pages.append(
             OCRPage(
                 page_index=pr.page_index,
@@ -804,7 +932,7 @@ async def _build_ocr_response_with_images(
                     label=r.label,
                     score=round(r.score, 4),
                     rect=r.rect,
-                    md_path=str(r.md_path) if r.md_path else None,
+                    md_path=r.md_path.name if r.md_path else None,  # 只回文件名，不回绝对路径（L-04）
                     markdown=r.markdown,
                 )
             )
@@ -837,15 +965,52 @@ async def health():
     )
 
 
+async def _run_single_image_ocr(
+        request_id: str,
+        voucher_id: str,
+        pil: PILImage.Image,
+        endpoint: str,
+) -> "OCRResponse | JSONResponse":
+    """提交单图到 scheduler 并等待结果；统一处理取消 / 完成的响应构造。
+
+    单图同步场景下，voucher 已被 _kick_dead_user_loop 剔除时 process_batch
+    会返回 ``cancelled=True`` 的空 PageResult，这里统一转成 200 cancelled 响应。
+    """
+    st = time.perf_counter()
+    try:
+        page_results, queue_wait = await _process_pages(request_id, [pil], voucher_id=voucher_id)
+    except asyncio.CancelledError:
+        elapsed = round(time.perf_counter() - st, 3)
+        logger.info(
+            "CANCEL: user=%s voucher=%s endpoint=%s elapsed=%.2fs",
+            request_id, voucher_id, endpoint, elapsed,
+        )
+        return _cancelled_response(request_id, voucher_id, elapsed)
+    # 同步响应场景：voucher 已被 _kick_dead_user_loop 剔除 → process_batch 给了 cancelled=True 空 PageResult
+    if page_results and page_results[0].cancelled:
+        elapsed = round(time.perf_counter() - st, 3)
+        logger.info(
+            "CANCEL_VOUCHER: user=%s voucher=%s endpoint=%s elapsed=%.2fs",
+            request_id, voucher_id, endpoint, elapsed,
+        )
+        return _cancelled_response(request_id, voucher_id, elapsed, queue_wait)
+    elapsed = time.perf_counter() - st
+    n_regions = sum(len(p.regions) for p in page_results)
+    logger.info(
+        "COMPLETE: user=%s voucher=%s endpoint=%s pages=1 regions=%d elapsed=%.2fs queue_wait=%.2fs",
+        request_id, voucher_id, endpoint, n_regions, elapsed, queue_wait,
+    )
+    return await _build_ocr_response_with_images(
+        request_id, [pil], page_results, elapsed, queue_wait,
+        voucher_id=voucher_id,
+    )
+
+
 # ─── 路由：单图 ──────────────────────────────────────────────────
 @app.post("/ocr/upload", response_model=OCRResponse)
 async def ocr_upload(request: Request, file: UploadFile = File(...)):
     _check_content_length(request, CFG.max_image_upload_mb)
-    raw = await file.read()
-    if len(raw) > CFG.max_image_upload_mb * 1024 * 1024:
-        raise HTTPException(
-            status_code=413, detail=f"图片超过 {CFG.max_image_upload_mb:.0f}MB 限制"
-        )
+    raw = await _read_upload_with_limit(file, CFG.max_image_upload_mb)
     try:
         rgb = _decode_raw_image(raw)
     except ValueError as e:
@@ -854,43 +1019,23 @@ async def ocr_upload(request: Request, file: UploadFile = File(...)):
     pil = _rgb_to_pil(rgb)
 
     request_id = _sanitize_user_id(request.query_params.get("user_id"))
-    voucher_id = request.query_params.get("voucher_id") or ""
+    voucher_id = _sanitize_voucher_id(request.query_params.get("voucher_id") or "")
     logger.info(
         "UPLOAD: user=%s voucher=%s endpoint=/ocr/upload file=%s size=%d bytes mime=%s",
         request_id, voucher_id, _safe_filename(file.filename), len(raw), file.content_type or "?",
     )
-    st = time.perf_counter()
-    try:
-        page_results, queue_wait = await _process_pages(request_id, [pil], voucher_id=voucher_id)
-    except asyncio.CancelledError:
-        elapsed = round(time.perf_counter() - st, 3)
-        logger.info(
-            "CANCEL: user=%s voucher=%s endpoint=/ocr/upload elapsed=%.2fs",
-            request_id, voucher_id, elapsed,
-        )
-        return _cancelled_response(request_id, voucher_id, elapsed)
-    # 同步响应场景：voucher 已被 _kick_dead_user_loop 剔除 → process_batch 给了 cancelled=True 空 PageResult
-    if page_results and page_results[0].cancelled:
-        elapsed = round(time.perf_counter() - st, 3)
-        logger.info(
-            "CANCEL_VOUCHER: user=%s voucher=%s endpoint=/ocr/upload elapsed=%.2fs",
-            request_id, voucher_id, elapsed,
-        )
-        return _cancelled_response(request_id, voucher_id, elapsed, queue_wait)
-    elapsed = time.perf_counter() - st
-    n_regions = sum(len(p.regions) for p in page_results)
-    logger.info(
-        "COMPLETE: user=%s voucher=%s endpoint=/ocr/upload pages=1 regions=%d elapsed=%.2fs queue_wait=%.2fs",
-        request_id, voucher_id, n_regions, elapsed, queue_wait,
-    )
-    return await _build_ocr_response_with_images(
-        request_id, [pil], page_results, elapsed, queue_wait,
-        voucher_id=voucher_id,
-    )
+    return await _run_single_image_ocr(request_id, voucher_id, pil, "/ocr/upload")
 
 
 @app.post("/ocr/base64", response_model=OCRResponse)
-async def ocr_base64(req: Base64Request, request: Request):
+async def ocr_base64(request: Request):
+    _check_content_length(request, CFG.max_image_upload_mb * 1.6)
+    body_limit = int(CFG.max_image_upload_mb * 1.6 * 1024 * 1024)
+    raw_body = await _read_body_with_limit(request, body_limit)
+    try:
+        req = Base64Request.model_validate_json(raw_body)
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求体不是合法 JSON")
     try:
         rgb = _decode_b64_to_rgb(req.payload)
     except ValueError as e:
@@ -898,38 +1043,12 @@ async def ocr_base64(req: Base64Request, request: Request):
     pil = _rgb_to_pil(rgb)
 
     request_id = _sanitize_user_id(request.query_params.get("user_id"))
-    voucher_id = request.query_params.get("voucher_id") or ""
+    voucher_id = _sanitize_voucher_id(request.query_params.get("voucher_id") or "")
     logger.info(
         "UPLOAD: user=%s voucher=%s endpoint=/ocr/base64 size=%d bytes (decoded=%dx%d)",
         request_id, voucher_id, len(req.payload), rgb.shape[1], rgb.shape[0],
     )
-    st = time.perf_counter()
-    try:
-        page_results, queue_wait = await _process_pages(request_id, [pil], voucher_id=voucher_id)
-    except asyncio.CancelledError:
-        elapsed = round(time.perf_counter() - st, 3)
-        logger.info(
-            "CANCEL: user=%s voucher=%s endpoint=/ocr/base64 elapsed=%.2fs",
-            request_id, voucher_id, elapsed,
-        )
-        return _cancelled_response(request_id, voucher_id, elapsed)
-    if page_results and page_results[0].cancelled:
-        elapsed = round(time.perf_counter() - st, 3)
-        logger.info(
-            "CANCEL_VOUCHER: user=%s voucher=%s endpoint=/ocr/base64 elapsed=%.2fs",
-            request_id, voucher_id, elapsed,
-        )
-        return _cancelled_response(request_id, voucher_id, elapsed, queue_wait)
-    elapsed = time.perf_counter() - st
-    n_regions = sum(len(p.regions) for p in page_results)
-    logger.info(
-        "COMPLETE: user=%s voucher=%s endpoint=/ocr/base64 pages=1 regions=%d elapsed=%.2fs queue_wait=%.2fs",
-        request_id, voucher_id, n_regions, elapsed, queue_wait,
-    )
-    return await _build_ocr_response_with_images(
-        request_id, [pil], page_results, elapsed, queue_wait,
-        voucher_id=voucher_id,
-    )
+    return await _run_single_image_ocr(request_id, voucher_id, pil, "/ocr/base64")
 
 
 # ─── 路由：PDF 多页（流式 / 异步进度） ──────────────────────────────
@@ -947,6 +1066,9 @@ async def _run_pdf_batch(
     """
     progress = _pdf_progress_store[user_id]
     jobs: list[Job] = []
+    # 每次上传都申请新代数；重复上传同一 user_id 时，新任务不会被旧取消标记影响
+    generation = scheduler.next_request_generation(user_id)
+
     try:
         for idx, pil_img in enumerate(pil_pages):
             if pil_img.mode != "RGB":
@@ -954,6 +1076,7 @@ async def _run_pdf_batch(
             job = scheduler.submit(
                 request_id=user_id, page_index=idx, image=pil_img,
                 voucher_id=voucher_id,
+                generation=generation,
             )
             jobs.append(job)
 
@@ -986,9 +1109,8 @@ async def _run_pdf_batch(
                     progress["pil_pages"][page_idx] = None
                 except asyncio.CancelledError:
                     progress["cancelled"] = True
-                    for j in jobs:
-                        if not j.fut.done():
-                            j.fut.cancel("cancelled")
+                    if scheduler is not None:
+                        await scheduler.cancel_jobs(jobs)
                     logger.info(
                         "CANCEL: user=%s voucher=%s endpoint=/ocr/pdf pages_pending=%d",
                         user_id, voucher_id, len([j for j in jobs if not j.fut.done()]),
@@ -1005,9 +1127,8 @@ async def _run_pdf_batch(
         # —— 标记 progress 为 cancelled，并把还没 done 的 job fut 也 cancel 掉，
         # 让 worker 的 set_result 跳过它们
         progress["cancelled"] = True
-        for j in jobs:
-            if not j.fut.done():
-                j.fut.cancel("request cancelled")
+        if scheduler is not None:
+            await scheduler.cancel_jobs(jobs)
         logger.info(
             "CANCEL: user=%s voucher=%s endpoint=/ocr/pdf pages_pending=%d (task cancelled)",
             user_id, voucher_id, len([j for j in jobs if not j.fut.done()]),
@@ -1035,7 +1156,9 @@ async def _run_pdf_batch(
 
 async def _make_pdf_page_dict(page_result: Any, pil_page: PILImage.Image) -> dict:
     """Build the JSON-serializable page dict returned by the PDF status endpoint."""
-    image_b64 = await run_in_threadpool(_pil_to_b64_png, pil_page)
+    # 展示图归一化（M-02）；width/height 与 region rect 保持原图坐标
+    display = await run_in_threadpool(_response_image, pil_page)
+    image_b64 = await run_in_threadpool(_pil_to_b64_png, display)
     return {
         "page_index": page_result.page_index,
         "width": page_result.width,
@@ -1048,7 +1171,7 @@ async def _make_pdf_page_dict(page_result: Any, pil_page: PILImage.Image) -> dic
                 "label": r.label,
                 "score": round(r.score, 4),
                 "rect": r.rect,
-                "md_path": str(r.md_path) if r.md_path else None,
+                "md_path": r.md_path.name if r.md_path else None,  # 只回文件名，不回绝对路径（L-04）
                 "markdown": r.markdown,
             }
             for b_idx, r in enumerate(page_result.regions)
@@ -1057,7 +1180,11 @@ async def _make_pdf_page_dict(page_result: Any, pil_page: PILImage.Image) -> dic
 
 
 async def _pdf_progress_cleanup_loop() -> None:
-    """每 60s 扫一次, 删除 finished 超过 PDF_PROGRESS_TTL_S 的进度条目。"""
+    """每 60s 扫一次, 删除 finished 超过 PDF_PROGRESS_TTL_S 的进度条目。
+
+    顺带清理 _request_vouchers / _request_vouchers_ts 中超过 TTL 的过期映射
+    （M-04：记录过期后校验自动放行，映射本身也该回收）。
+    """
     logger.info("pdf_progress cleanup enabled: ttl=%ds", CFG.pdf_progress_ttl_s)
     while True:
         try:
@@ -1072,6 +1199,15 @@ async def _pdf_progress_cleanup_loop() -> None:
         for uid, age in expired:
             _pdf_progress_store.pop(uid, None)
             logger.info("CLEANUP: pdf_progress removed user=%s (age=%.0fs)", uid, age)
+        # 清理过期 voucher 映射（每 60s tick 一次足够）
+        cutoff = time.monotonic() - _REQUEST_VOUCHER_TTL_S
+        async with _request_vouchers_lock:
+            stale = [u for u, ts in _request_vouchers_ts.items() if ts < cutoff]
+            for u in stale:
+                _request_vouchers.pop(u, None)
+                _request_vouchers_ts.pop(u, None)
+            if stale:
+                logger.info("CLEANUP: removed %d expired voucher mapping(s)", len(stale))
 
 
 @app.post("/ocr/pdf")
@@ -1082,11 +1218,7 @@ async def ocr_pdf(request: Request, file: UploadFile = File(...)):
     ``GET /api/ocr/pdf-status/{user_id}`` 轮询进度, 每完成一页就拿到新数据。
     """
     _check_content_length(request, CFG.max_pdf_upload_mb)
-    raw = await file.read()
-    if len(raw) > CFG.max_pdf_upload_mb * 1024 * 1024:
-        raise HTTPException(
-            status_code=413, detail=f"PDF 超过 {CFG.max_pdf_upload_mb:.0f}MB 限制"
-        )
+    raw = await _read_upload_with_limit(file, CFG.max_pdf_upload_mb)
     if raw[:4] != b"%PDF":
         raise HTTPException(status_code=400, detail="不是合法 PDF 文件")
 
@@ -1121,13 +1253,27 @@ async def ocr_pdf(request: Request, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="PDF 没有页面")
 
     user_id = _sanitize_user_id(request.query_params.get("user_id"))
-    voucher_id = request.query_params.get("voucher_id") or ""
+    voucher_id = _sanitize_voucher_id(request.query_params.get("voucher_id") or "")
     logger.info(
         "UPLOAD: user=%s voucher=%s endpoint=/ocr/pdf file=%s size=%d bytes pages=%d dpi=%.0f",
         user_id, voucher_id, _safe_filename(file.filename), len(raw), len(pil_pages), CFG.pdf_dpi,
     )
+    # 登记 user_id → voucher 归属，供 /api/cancel 与 /api/ocr/pdf-status 校验（M-04）
+    _register_request_voucher(user_id, voucher_id)
 
     async with _pdf_progress_lock:
+        # NEW-03：同一 user_id 重复上传时，先取消旧的后台任务，再覆盖进度条目，
+        # 避免旧任务成为不可查询 / 不可取消的孤儿
+        old = _pdf_progress_store.get(user_id)
+        if old is not None:
+            old_task = old.get("task")
+            if old_task is not None and not old_task.done():
+                old_task.cancel()
+                logger.info(
+                    "PDF override: cancelled old task for user=%s (re-upload)",
+                    user_id,
+                )
+            old["cancelled"] = True
         _pdf_progress_store[user_id] = {
             "voucher_id": voucher_id,
             "total_pages": len(pil_pages),
@@ -1164,8 +1310,10 @@ async def ocr_pdf(request: Request, file: UploadFile = File(...)):
 
 
 @app.get("/api/ocr/pdf-status/{user_id}")
-async def pdf_status(user_id: str, since: int = Query(default=0, ge=0)):
+async def pdf_status(user_id: str, since: int = Query(default=0, ge=0), voucher_id: str = ""):
     user_id = _sanitize_user_id(user_id)
+    voucher_id = _sanitize_voucher_id(voucher_id)
+    await _check_voucher_guard(user_id, voucher_id)
     progress = _pdf_progress_store.get(user_id)
     if not progress:
         return JSONResponse(
@@ -1201,7 +1349,7 @@ async def pdf_status(user_id: str, since: int = Query(default=0, ge=0)):
 
 # ─── 主动取消：前端点 remove 按钮时发起的 cancel ─────────────────
 @app.post("/api/cancel/{user_id}")
-async def cancel_user_request(user_id: str):
+async def cancel_user_request(user_id: str, voucher_id: str = ""):
     """主动取消某个 upload（user_id）的所有 pending + in-flight 工作。
 
     跟 /alive 倒计时触发的 voucher 取消是两套独立机制：
@@ -1218,10 +1366,15 @@ async def cancel_user_request(user_id: str):
        task，并把 ``progress["cancelled"] = True``，前端下次 poll 立刻看到
     3. 单图同步响应路径：handler 仍在 ``await asyncio.gather``，``fut.cancel()`` 后
        gather 会抛 CancelledError，handler 返回 200 cancelled
+
+    ``voucher_id``（query 参数，M-04）：任务提交时登记的归属 voucher；不匹配返回
+    403，防止局域网内猜中 user_id 就取消他人任务。记录过期后放行（兼容旧客户端）。
     """
     user_id = _sanitize_user_id(user_id)
+    voucher_id = _sanitize_voucher_id(voucher_id)
     if scheduler is None:
         raise HTTPException(status_code=503, detail="Scheduler 尚未初始化")
+    await _check_voucher_guard(user_id, voucher_id)
 
     cancelled = await scheduler.cancel_request(user_id)
 
@@ -1257,15 +1410,27 @@ async def alive_user_pend(request: AliveRequest):
 
     首次出现的 voucher 视为新登录；已存在的 voucher 重置 TTL 即可（两条分支
     语义等价，统一处理）。
+
+    NEW-01 复活语义：voucher 曾被 ``_kick_dead_user_loop`` 标记取消（倒计时归零）
+    后，这里重新注册即视为"复活"——把该 voucher 从 scheduler 的取消追踪集合里
+    移除，否则它名下所有后续上传都会被 process_batch 第一层过滤静默取消。
     """
     voucher = request.aliveVoucher
     if not voucher:
         raise HTTPException(status_code=400, detail="voucher 不能为空")
+    voucher = _sanitize_voucher_id(voucher)
     async with _alive_lock:
         is_new = voucher not in _alive_users
         _alive_users[voucher] = CFG.alive_initial_ttl
     if is_new:
         logger.info("User '%s' Logged in", voucher)
+    # 复活：移除该 voucher 的取消标记（若存在）。旧客户端没绑定 voucher 时
+    # scheduler 侧同样安全（空串不匹配任何取消记录）。
+    if scheduler is not None:
+        try:
+            await scheduler.revive_voucher(voucher)
+        except Exception as e:
+            logger.exception("revive_voucher(%s) failed: %s", voucher, e)
     return {"success": True, "voucher": voucher, "ttl": CFG.alive_initial_ttl}
 
 
